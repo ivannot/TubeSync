@@ -299,13 +299,18 @@ def _is_quota_reason(reasons: set) -> bool:
     return False
 
 def resumable_upload(youtube, file_path: Path, title: str, description: str, privacy: str, category_id: int, chunk_mb: int, max_retries: int):
+    made_for_kids = cfg.getboolean("general", "made_for_kids", fallback=False)
+
     body = {
         "snippet": {
             "title": title,
-            "description": description or "",
-            "categoryId": str(category_id) if category_id else None
+            "description": description,
+            "categoryId": category_id,
         },
-        "status": {"privacyStatus": privacy or "private"}
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": made_for_kids
+        }
     }
     body["snippet"] = {k: v for k, v in body["snippet"].items() if v is not None}
 
