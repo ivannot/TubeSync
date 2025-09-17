@@ -1,8 +1,9 @@
 #!/bin/sh
 # Unified control script for TubeSync (start|stop|restart|status)
-# Reads paths from config.ini
+# Uses relative paths (script directory)
 
-CONFIG="/volume2/TubeSync/config.ini"
+BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="$BASE_DIR/config.ini"
 EVENT_HEX="${TS_EVENT_HEX:-0x11100000}"
 
 # helper: extract value from ini
@@ -14,8 +15,8 @@ cfg() {
 
 VENV="$(cfg venv_path)"
 SCRIPT="$(cfg watcher_path)"
-if [ -z "$VENV" ]; then VENV="/volume2/TubeSync/.venv"; fi
-if [ -z "$SCRIPT" ]; then SCRIPT="/volume2/TubeSync/tubesync_watcher.py"; fi
+if [ -z "$VENV" ]; then VENV="$BASE_DIR/.venv"; fi
+if [ -z "$SCRIPT" ]; then SCRIPT="$BASE_DIR/tubesync_watcher.py"; fi
 
 synolog() {
   LEVEL="$1"; MSG="$2"
