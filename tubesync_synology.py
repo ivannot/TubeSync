@@ -23,6 +23,10 @@ SCOPES = [
 class QuotaExceeded(Exception):
     pass
 
+# -------------------------
+# Logging (Synology first)
+# -------------------------
+
 class SynologyLogHandler(logging.Handler):
     """Invia al Log Center usando synologset1 con argomenti corretti."""
     LEVEL_MAP = {
@@ -36,9 +40,9 @@ class SynologyLogHandler(logging.Handler):
         super().__init__()
         self.program = program
         raw = os.getenv("TS_EVENT_HEX", "0x11100000")
-        event_id = raw.upper().replace("0X", "")
-        event_id = (event_id + "00000000")[:8]
-        self.event_id = event_id
+        hex_only = raw.upper().replace("0X", "")
+        hex_only = (hex_only + "00000000")[:8]
+        self.event_id = "0x" + hex_only
 
     def emit(self, record):
         try:
@@ -69,6 +73,10 @@ def setup_logging():
         logging.root.removeHandler(h)
     logging.basicConfig(level=logging.INFO, handlers=handlers)
 
+# -------------------------
+# Config & util
+# -------------------------
+
 def load_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
@@ -96,12 +104,13 @@ def ensure_db(db_path: Path):
         size INTEGER,
         mtime REAL,
         sha1 TEXT,
-        status TEXT,
+        status TEXT,          -- pending|done|error
         video_id TEXT,
         error TEXT,
         created_at REAL,
         updated_at REAL
-    )""")
+    )
+    """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status)")
     con.commit()
     return con
@@ -211,6 +220,7 @@ def get_authenticated_service(cfg: ConfigParser):
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def fetch_existing_titles(youtube):
+    """Ritorna dict { titolo_lower: video_id } per tutti i video della playlist 'Uploads'."""
     titles = {}
     ch = youtube.channels().list(part="contentDetails", mine=True).execute()
     items = ch.get("items", [])
@@ -311,14 +321,16 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str,
         except (HttpError, ResumableUploadError) as e:
             reasons = _parse_error_reasons(e)
 
+            # Stop immediato in caso di quota/rate limit
             if (getattr(e, "resp", None) and getattr(e.resp, "status", None) in (403, 429)) and _is_quota_reason(reasons):
                 raise QuotaExceeded(",".join(sorted(reasons)) or "quotaExceeded") from e
 
+            # Retri per errori temporanei
             status_code = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
             if status_code in (500, 502, 503, 504) and retry < max_retries:
                 retry += 1
                 sleep_s = backoff ** retry
-                logging.warn(f"[{file_path.name}] Errore temporaneo {status_code}, retry {retry}/{max_retries} tra {sleep_s}s")
+                logging.warning(f"[{file_path.name}] Errore temporaneo {status_code}, retry {retry}/{max_retries} tra {sleep_s}s")
                 time.sleep(sleep_s)
                 continue
             raise
@@ -327,10 +339,14 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str,
             if retry < max_retries:
                 retry += 1
                 sleep_s = backoff ** retry
-                logging.warn(f"[{file_path.name}] Eccezione {type(e).__name__}: {e} — retry {retry}/{max_retries} tra {sleep_s}s")
+                logging.warning(f"[{file_path.name}] Eccezione {type(e).__name__}: {e} — retry {retry}/{max_retries} tra {sleep_s}s")
                 time.sleep(sleep_s)
                 continue
             raise
+
+# -------------------------
+# Pausa quota
+# -------------------------
 
 def check_pause(cfg: ConfigParser):
     pf = get_path_from_cfg(cfg, "general", "pause_file", ".pause_until")
@@ -351,6 +367,10 @@ def set_pause(cfg: ConfigParser, minutes: int):
     pf.write_text(str(until))
     return until
 
+# -------------------------
+# Main
+# -------------------------
+
 def main():
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else (SCRIPT_DIR / "config.ini")
     cfg = load_config(cfg_path)
@@ -359,6 +379,7 @@ def main():
     db_path = get_path_from_cfg(cfg, "general", "db_path", "state.db")
     con = ensure_db(db_path)
 
+    # sorgenti & filtri
     if not cfg.has_option("general", "source_dirs"):
         logging.error("Nessuna sorgente in [general] source_dirs")
         sys.exit(2)
@@ -367,6 +388,7 @@ def main():
     min_size_mb = cfg.getint("general", "skip_if_smaller_than_mb", fallback=5)
     min_size_bytes = max(0, min_size_mb) * 1024 * 1024
 
+    # upload options
     privacy       = cfg.get("general", "privacy", fallback="private")
     category_id   = cfg.getint("general", "category_id", fallback=22)
     description   = cfg.get("general", "description", fallback="")
@@ -375,18 +397,22 @@ def main():
     chunk_mb      = cfg.getint("general", "chunk_mb", fallback=8)
     max_retries   = cfg.getint("general", "max_retries", fallback=8)
 
+    # idratazione
     hydrate       = cfg.getboolean("general", "hydrate_from_youtube_on_start", fallback=True)
     hydrate_match = cfg.get("general", "hydrate_match", fallback="exact_title").strip().lower()
 
+    # mail
     subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
     to_email    = cfg.get("email", "to_email", fallback=None)
 
+    # pausa?
     paused_until = check_pause(cfg)
     if paused_until:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(paused_until))
-        logging.warn(f"Pausa attiva fino a {when} per quota limit. Esco.")
+        logging.warning(f"Pausa attiva fino a {when} per quota limit. Esco.")
         return
 
+    # auth
     try:
         yt = get_authenticated_service(cfg)
     except Exception as e:
@@ -395,6 +421,7 @@ def main():
         send_email(cfg, f"{subj_prefix} Auth error", err + "\n\n" + traceback.format_exc())
         sys.exit(2)
 
+    # idratazione
     existing_title_map = {}
     if hydrate:
         try:
@@ -402,7 +429,7 @@ def main():
             existing_title_map = fetch_existing_titles(yt)
             logging.info(f"Idratazione completata: trovati {len(existing_title_map)} video esistenti.")
         except Exception as e:
-            logging.warn(f"Idratazione fallita (procedo comunque): {e}")
+            logging.warning(f"Idratazione fallita (procedo comunque): {e}")
 
     count_total = count_done = count_skipped = count_errors = count_marked_done = 0
 
@@ -415,6 +442,7 @@ def main():
             title = p.stem
             title_key = title.strip().lower()
 
+            # DB: già done invariato?
             row = db_get(con, p)
             if row:
                 _id, status, old_size, old_mtime, old_sha1, video_id = row
@@ -423,6 +451,7 @@ def main():
                     count_skipped += 1
                     continue
 
+            # già su YT (idratazione)?
             if hydrate and hydrate_match == "exact_title":
                 found_vid = existing_title_map.get(title_key)
                 if found_vid:
@@ -431,6 +460,7 @@ def main():
                     logging.info(f"[{p.name}] Già presente su YouTube (ID: {found_vid}) → marcato done.")
                     continue
 
+            # upload
             db_upsert(con, p, size, mtime, sha1, "pending", None, None)
             video_id = resumable_upload(
                 yt, p, title, description, privacy, category_id, chunk_mb, max_retries, made_for_kids
@@ -456,7 +486,7 @@ def main():
                     f"Lo script va in pausa per {cooldown_min} minuti (fino a {when}).\n"
                     f"Nessun altro file verrà processato in questo run.")
             send_email(cfg, subject, body)
-            return
+            return  # stop: evita mail multiple
 
         except Exception as e:
             count_errors += 1
