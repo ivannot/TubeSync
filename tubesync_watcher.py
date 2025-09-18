@@ -15,17 +15,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # -------------------------
 
 class SynologyLogHandler(logging.Handler):
+    """Invia al Log Center usando synologset1 con argomenti corretti."""
     LEVEL_MAP = {
-        logging.CRITICAL: "crit",
+        logging.CRITICAL: "err",
         logging.ERROR:    "err",
-        logging.WARNING:  "warning",
+        logging.WARNING:  "warn",
         logging.INFO:     "info",
-        logging.DEBUG:    "debug",
+        logging.DEBUG:    "info",
     }
     def __init__(self, program="TubeSyncWatcher"):
         super().__init__()
         self.program = program
-        self.event_hex = os.getenv("TS_EVENT_HEX", "0x11100000")
+        raw = os.getenv("TS_EVENT_HEX", "0x11100000")
+        event_id = raw.upper().replace("0X", "")
+        event_id = (event_id + "00000000")[:8]
+        self.event_id = event_id
 
     def emit(self, record):
         try:
@@ -33,7 +37,7 @@ class SynologyLogHandler(logging.Handler):
             msg = self.format(record)
             full = f"{self.program}: {msg}"
             subprocess.run(
-                ["/usr/syno/bin/synologset1", "sys", level, self.event_hex, full],
+                ["/usr/syno/bin/synologset1", "sys", level, self.event_id, full],
                 check=False
             )
         except Exception:
