@@ -5,6 +5,7 @@ import sys, os, time, logging, logging.handlers, subprocess, threading
 from pathlib import Path
 from configparser import ConfigParser
 from queue import Queue, Empty
+from typing import Tuple  # <- ✅ compatibilità Py3.8
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -108,7 +109,7 @@ def clear_expired_pause_if_any(cfg: ConfigParser) -> bool:
             return True
     return False
 
-def pause_active(cfg: ConfigParser) -> tuple[bool, float]:
+def pause_active(cfg: ConfigParser) -> Tuple[bool, float]:  # <- ✅ Tuple
     until = read_pause_until(cfg)
     return (time.time() < until, until)
 
@@ -140,7 +141,7 @@ def run_uploader(cfg_path: Path, uploader_path: Path):
 # -------------------------
 
 class DebouncedHandler(FileSystemEventHandler):
-    def __init__(self, q: Queue, allowed_exts: set[str]):
+    def __init__(self, q: Queue, allowed_exts: set):
         super().__init__()
         self.q = q
         self.allowed_exts = allowed_exts
@@ -196,7 +197,7 @@ def main():
     # coda eventi + timer debounce
     q: Queue = Queue()
     timer_lock = threading.Lock()
-    debounce_timer: threading.Timer | None = None
+    debounce_timer = None  # type: threading.Timer
 
     def trigger_run(reason: str):
         active, until = pause_active(cfg)
