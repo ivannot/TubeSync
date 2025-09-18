@@ -3,7 +3,7 @@
 
 import sys, os, time, json, hashlib, logging, logging.handlers, subprocess, traceback
 import sqlite3, smtplib
-from email.mime_text import MIMEText
+from email.mime.text import MIMEText
 from email.utils import formatdate
 from pathlib import Path
 from configparser import ConfigParser
