@@ -8,16 +8,27 @@ BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$BASE_DIR/config.ini"
 VENV="$BASE_DIR/.venv"
 WATCHER="$BASE_DIR/tubesync_watcher.py"
-EVENT_HEX="${TS_EVENT_HEX:-0x11100000}"   # opzionale: export TS_EVENT_HEX=0x11100001
 
 synolog() {
-  # synolog <level> "<message>"
+  # synolog <level> "message"  (level: info|warn|err)
   level="$1"; shift
   msg="$*"
+
+  case "$level" in
+    info|warn|err) ;;
+    warning) level="warn" ;;
+    error)   level="err" ;;
+    *)       level="info" ;;
+  esac
+
+  raw="${TS_EVENT_HEX:-0x11100000}"
+  event_id="$(echo "$raw" | sed 's/^0[xX]//' | tr '[:lower:]' '[:upper:]')"
+  event_id="$(printf '%-8s' "$event_id" | tr ' ' '0' | cut -c1-8)"
+
   if [ -x /usr/syno/bin/synologset1 ]; then
-    /usr/syno/bin/synologset1 sys "$level" "$EVENT_HEX" "TubeSync: $msg"
+    /usr/syno/bin/synologset1 sys "$level" "$event_id" "TubeSync: $msg"
   else
-    logger -t "TubeSync" -p user."$level" "$msg"
+    logger -t "TubeSync" -p "user.$level" "$msg"
   fi
 }
 
@@ -38,7 +49,6 @@ start() {
 }
 
 stop() {
-  # killer “prudente”: solo il watcher di questa cartella
   pids="$(pgrep -f "$WATCHER" || true)"
   if [ -n "$pids" ]; then
     echo "$pids" | xargs -r kill >/dev/null 2>&1 || true
@@ -47,7 +57,7 @@ stop() {
     synolog info "Watcher stopped"
   else
     echo "⚠️  No TubeSync Watcher running."
-    synolog warning "No watcher running"
+    synolog warn "No watcher running"
   fi
 }
 
