@@ -5,7 +5,6 @@ import sys, os, time, logging, logging.handlers, subprocess, threading
 from pathlib import Path
 from configparser import ConfigParser
 from queue import Queue, Empty
-
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -90,6 +89,20 @@ def read_pause_until(cfg: ConfigParser) -> float:
             pass
         return 0.0
 
+def clear_expired_pause_if_any(cfg: ConfigParser) -> bool:
+    """True se c'era una pausa scaduta che ho rimosso ora."""
+    pf = get_path_from_cfg(cfg, "general", "pause_file", ".pause_until")
+    if pf.exists():
+        try:
+            until = float(pf.read_text().strip())
+        except Exception:
+            pf.unlink(missing_ok=True)
+            return True
+        if time.time() >= until:
+            pf.unlink(missing_ok=True)
+            return True
+    return False
+
 def pause_active(cfg: ConfigParser) -> tuple[bool, float]:
     until = read_pause_until(cfg)
     return (time.time() < until, until)
@@ -99,7 +112,6 @@ def pause_active(cfg: ConfigParser) -> tuple[bool, float]:
 # -------------------------
 
 def uploader_is_running(uploader_path: Path) -> bool:
-    # Controllo semplice: c’è un processo python che sta eseguendo quel file?
     try:
         out = subprocess.check_output(["pgrep", "-af", str(uploader_path)], text=True)
         lines = [ln for ln in out.strip().splitlines() if "python" in ln or "python3" in ln]
@@ -141,7 +153,6 @@ class DebouncedHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory and self._interesting(Path(event.src_path)):
-            # spesso le GoPro chiudono il file a “chunk”: il debounce gestirà
             self.q.put(("fs", time.time()))
 
 # -------------------------
@@ -154,7 +165,7 @@ def main():
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else (SCRIPT_DIR / "config.ini")
     cfg = load_config(cfg_path)
 
-    # cartelle da osservare
+    # roots
     if not cfg.has_option("general", "source_dirs"):
         logging.error("Nessuna root valida: mancano [general].source_dirs")
         sys.exit(2)
@@ -170,7 +181,7 @@ def main():
                                                   fallback=".mp4,.mov,.m4v,.avi,.mkv").split(",")]
     allowed_exts = set(allowed)
 
-    # debounce & pianificazioni
+    # debounce & schedulazioni
     debounce_sec = cfg.getint("watcher", "debounce_seconds", fallback=90)
     rescan_minutes = cfg.getint("watcher", "rescan_minutes", fallback=60)
     pause_check_seconds = cfg.getint("watcher", "pause_check_seconds", fallback=30)
@@ -186,8 +197,9 @@ def main():
         active, until = pause_active(cfg)
         if active:
             when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-            logging.info(f"Pausa attiva (quota). Rinvio run: pausa fino a {when}. (trigger: {reason})")
+            logging.info(f"Trigger '{reason}': pausa attiva fino a {when}, non lancio.")
             return
+        logging.info(f"Trigger '{reason}': lancio uploader.")
         run_uploader(cfg_path, uploader_path)
 
     def start_debounce(reason: str):
@@ -195,6 +207,7 @@ def main():
         with timer_lock:
             if debounce_timer and debounce_timer.is_alive():
                 debounce_timer.cancel()
+            logging.info(f"Evento FS → debounce {debounce_sec}s (reason={reason})")
             debounce_timer = threading.Timer(debounce_sec, trigger_run, args=(reason,))
             debounce_timer.daemon = True
             debounce_timer.start()
@@ -207,10 +220,14 @@ def main():
         logging.info(f"Osservo: {r}")
     observer.start()
 
-    # 1) run iniziale (se non in pausa)
+    # se la pausa è scaduta al boot, rimuovila e lancia subito
+    if clear_expired_pause_if_any(cfg):
+        logging.info("Pausa scaduta rilevata all'avvio: file rimosso, lancio run iniziale.")
+
+    # run iniziale
     trigger_run("initial_scan")
 
-    # 2) thread che consuma la coda e lancia il debounce
+    # consumer eventi FS
     def consumer():
         while True:
             try:
@@ -221,25 +238,26 @@ def main():
 
     threading.Thread(target=consumer, daemon=True).start()
 
-    # 3) thread: controllo scadenza pausa
+    # controllo scadenza pausa
     def pause_watcher():
-        next_fire_if_paused = 0.0
+        last_active = None
         while True:
             active, until = pause_active(cfg)
-            now = time.time()
             if active:
-                # pianifica un “wake-up” poco dopo la scadenza
-                next_fire_if_paused = max(next_fire_if_paused, until + 1)
+                if last_active is not True:
+                    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+                    logging.info(f"Pausa attiva (quota) fino a {when}.")
+                last_active = True
             else:
-                if next_fire_if_paused and now >= next_fire_if_paused:
-                    logging.info("Pausa scaduta: lancio run automatico.")
+                if last_active:
+                    logging.info("Pausa terminata: lancio run per recuperare i pending.")
                     trigger_run("pause_expired")
-                    next_fire_if_paused = 0.0
+                last_active = False
             time.sleep(max(1, pause_check_seconds))
 
     threading.Thread(target=pause_watcher, daemon=True).start()
 
-    # 4) thread: rescan periodico (opzionale)
+    # rescan periodico (opzionale)
     def periodic_rescan():
         if rescan_minutes <= 0:
             return
@@ -261,7 +279,6 @@ def main():
         observer.stop()
         observer.join()
         logging.info("Watcher terminato.")
-        # se c’è un timer in corso, lascialo finire senza rilanciare nulla
 
 if __name__ == "__main__":
     main()
