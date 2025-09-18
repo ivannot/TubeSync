@@ -21,6 +21,7 @@ SCOPES = [
 ]
 
 class QuotaExceeded(Exception):
+    """Quota/rate/upload limit — va in pausa e termina il run."""
     pass
 
 # -------------------------
@@ -28,7 +29,6 @@ class QuotaExceeded(Exception):
 # -------------------------
 
 class SynologyLogHandler(logging.Handler):
-    """Invia al Log Center usando synologset1 con argomenti corretti."""
     LEVEL_MAP = {
         logging.CRITICAL: "err",
         logging.ERROR:    "err",
@@ -248,6 +248,7 @@ def fetch_existing_titles(youtube):
     return titles
 
 def _parse_error_reasons(exc) -> set:
+    """Estrae tutti i 'reason' dall'errore API e normalizza in lowercase."""
     reasons = set()
     try:
         content = getattr(exc, "content", None)
@@ -261,24 +262,26 @@ def _parse_error_reasons(exc) -> set:
                 r = (e.get("reason") or "").lower()
                 if r:
                     reasons.add(r)
-            if not reasons and "details" in err:
-                for d in err["details"]:
-                    r = (d.get("reason") or "").lower()
-                    if r:
-                        reasons.add(r)
+            # alcuni client mettono info in 'message'
+            msg = (err.get("message") or "").lower()
+            for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded", "uploadlimitexceeded"):
+                if key in msg:
+                    reasons.add(key)
     except Exception:
         pass
     try:
-        msg = str(exc)
-        for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded"):
-            if key in msg.lower():
+        # fallback: cerca nel testo generale dell'eccezione
+        msg = str(exc).lower()
+        for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded", "uploadlimitexceeded"):
+            if key in msg:
                 reasons.add(key)
     except Exception:
         pass
     return reasons
 
 def _is_quota_reason(reasons: set) -> bool:
-    for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded"):
+    # includiamo anche uploadLimitExceeded
+    for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded", "uploadlimitexceeded"):
         if key in reasons:
             return True
     return False
@@ -320,13 +323,13 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str,
 
         except (HttpError, ResumableUploadError) as e:
             reasons = _parse_error_reasons(e)
+            status_code = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
 
-            # Stop immediato in caso di quota/rate limit
-            if (getattr(e, "resp", None) and getattr(e.resp, "status", None) in (403, 429)) and _is_quota_reason(reasons):
+            # ⚠️ Tratta come QUOTA anche 400 se reason è 'uploadLimitExceeded'
+            if (status_code in (400, 403, 429)) and _is_quota_reason(reasons):
                 raise QuotaExceeded(",".join(sorted(reasons)) or "quotaExceeded") from e
 
             # Retri per errori temporanei
-            status_code = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
             if status_code in (500, 502, 503, 504) and retry < max_retries:
                 retry += 1
                 sleep_s = backoff ** retry
@@ -409,7 +412,7 @@ def main():
     paused_until = check_pause(cfg)
     if paused_until:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(paused_until))
-        logging.warning(f"Pausa attiva fino a {when} per quota limit. Esco.")
+        logging.warning(f"Pausa attiva fino a {when} per quota/limite. Esco.")
         return
 
     # auth
@@ -480,9 +483,9 @@ def main():
             cooldown_min = cfg.getint("general", "quota_cooldown_minutes", fallback=120)
             until = set_pause(cfg, cooldown_min)
             when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-            logging.error(f"Quota exceeded ({reason}): pausa di {cooldown_min}m (fino a {when}). Stop immediato.")
-            subject = f"{subj_prefix} Quota exceeded — pausa fino a {when}"
-            body = (f"Hai raggiunto la quota YouTube ({reason}).\n"
+            logging.error(f"Quota/Limite ({reason}): pausa di {cooldown_min}m (fino a {when}). Stop immediato.")
+            subject = f"{subj_prefix} Limite raggiunto — pausa fino a {when}"
+            body = (f"Hai raggiunto un limite YouTube ({reason}).\n"
                     f"Lo script va in pausa per {cooldown_min} minuti (fino a {when}).\n"
                     f"Nessun altro file verrà processato in questo run.")
             send_email(cfg, subject, body)
