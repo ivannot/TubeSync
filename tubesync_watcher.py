@@ -21,15 +21,16 @@ class SynologyLogHandler(logging.Handler):
         logging.ERROR:    "err",
         logging.WARNING:  "warn",
         logging.INFO:     "info",
-        logging.DEBUG:    "info",
+        logging.DEBUG:    "info",   # Synology non ha 'debug': declasso a info
     }
     def __init__(self, program="TubeSyncWatcher"):
         super().__init__()
         self.program = program
+        # Normalizza in *0x + 8 cifre uppercase*
         raw = os.getenv("TS_EVENT_HEX", "0x11100000")
-        event_id = raw.upper().replace("0X", "")
-        event_id = (event_id + "00000000")[:8]
-        self.event_id = event_id
+        hex_only = raw.upper().replace("0X", "")
+        hex_only = (hex_only + "00000000")[:8]
+        self.event_id = "0x" + hex_only
 
     def emit(self, record):
         try:
