@@ -17,13 +17,16 @@ synolog() {
   case "$level" in
     info|warn|err) ;;
     warning) level="warn" ;;
-    error)   level="err" ;;
+    error)   level="err"  ;;
     *)       level="info" ;;
   esac
 
+  # Normalizza EVENT HEX in formato *con* 0x + 8 cifre uppercase
   raw="${TS_EVENT_HEX:-0x11100000}"
-  event_id="$(echo "$raw" | sed 's/^0[xX]//' | tr '[:lower:]' '[:upper:]')"
-  event_id="$(printf '%-8s' "$event_id" | tr ' ' '0' | cut -c1-8)"
+  # rimuovi eventuale 0x, uppercase, pad/tronca a 8, poi ri-prepende 0x
+  hex="$(echo "$raw" | sed 's/^0[xX]//' | tr '[:lower:]' '[:upper:]')"
+  hex="$(printf '%-8s' "$hex" | tr ' ' '0' | cut -c1-8)"
+  event_id="0x$hex"
 
   if [ -x /usr/syno/bin/synologset1 ]; then
     /usr/syno/bin/synologset1 sys "$level" "$event_id" "TubeSync: $msg"
