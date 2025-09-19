@@ -7,11 +7,14 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from configparser import ConfigParser
 
+# opzionali
 try:
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
 except ImportError:
     SendGridAPIClient = None
+
+import requests
 
 
 def load_cfg(path: str) -> ConfigParser:
@@ -23,7 +26,7 @@ def load_cfg(path: str) -> ConfigParser:
     return cfg
 
 
-def send_via_sendgrid(cfg: ConfigParser) -> None:
+def test_sendgrid(cfg: ConfigParser) -> None:
     if not SendGridAPIClient:
         print("❌ Libreria SendGrid non disponibile. Esegui: pip install sendgrid", file=sys.stderr)
         sys.exit(3)
@@ -33,21 +36,11 @@ def send_via_sendgrid(cfg: ConfigParser) -> None:
     to_email   = cfg.get("email", "to_email")
     prefix     = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
 
-    if not api_key:
-        print("❌ Manca 'sendgrid_api_key' in [email] del config.ini", file=sys.stderr)
-        sys.exit(4)
-
     subject = prefix + " Test email"
     body    = "This is a TubeSync email test via SendGrid."
 
-    message = Mail(
-        from_email=from_email,
-        to_emails=to_email,
-        subject=subject,
-        plain_text_content=body
-    )
-
     try:
+        message = Mail(from_email=from_email, to_emails=to_email, subject=subject, plain_text_content=body)
         sg = SendGridAPIClient(api_key)
         resp = sg.send(message)
         print(f"✅ SendGrid OK — HTTP {resp.status_code}")
@@ -56,7 +49,41 @@ def send_via_sendgrid(cfg: ConfigParser) -> None:
         sys.exit(5)
 
 
-def send_via_smtp(cfg: ConfigParser) -> None:
+def test_smtp2go_api(cfg: ConfigParser) -> None:
+    api_key   = cfg.get("email", "smtp2go_api_key", fallback=None)
+    api_url   = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
+    from_email= cfg.get("email", "from_email")
+    to_email  = cfg.get("email", "to_email")
+    prefix    = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
+
+    if not api_key:
+        print("❌ Manca 'smtp2go_api_key' in [email]", file=sys.stderr)
+        sys.exit(4)
+
+    subject = prefix + " Test email"
+    body    = "This is a TubeSync email test via SMTP2GO API."
+
+    payload = {
+        "api_key": api_key,
+        "to": [to_email],
+        "sender": from_email,
+        "subject": subject,
+        "text_body": body,
+    }
+
+    print(f"→ POST {api_url} (sender={from_email} to={to_email})")
+    try:
+        r = requests.post(api_url, json=payload, timeout=30)
+        print("← HTTP", r.status_code)
+        print(r.text)
+        if r.status_code != 200:
+            sys.exit(6)
+    except Exception as e:
+        print(f"❌ SMTP2GO API ERROR — {e}", file=sys.stderr)
+        sys.exit(6)
+
+
+def test_smtp(cfg: ConfigParser) -> None:
     host      = cfg.get("email", "smtp_host", fallback="localhost")
     port      = cfg.getint("email", "smtp_port", fallback=25)
     use_tls   = cfg.getboolean("email", "use_tls", fallback=False)
@@ -81,7 +108,7 @@ def send_via_smtp(cfg: ConfigParser) -> None:
             server = smtplib.SMTP_SSL(host, port, timeout=40)
         else:
             server = smtplib.SMTP(host, port, timeout=40)
-            server.set_debuglevel(1)  # sempre verboso
+            server.set_debuglevel(1)  # verboso
         if use_tls and not use_ssl:
             server.starttls()
         if username and password:
@@ -100,18 +127,20 @@ def main():
         sys.exit(1)
 
     cfg = load_cfg(sys.argv[1])
-    method = cfg.get("email", "method", fallback="smtp").strip().lower()
-
     if not cfg.getboolean("email", "enabled", fallback=False):
         print("⚠️  [email].enabled=false — nessun invio eseguito.")
         sys.exit(0)
 
+    method = cfg.get("email", "method", fallback="smtp").strip().lower()
+
     if method == "sendgrid":
-        send_via_sendgrid(cfg)
+        test_sendgrid(cfg)
+    elif method == "smtp2go_api":
+        test_smtp2go_api(cfg)
     elif method == "smtp":
-        send_via_smtp(cfg)
+        test_smtp(cfg)
     else:
-        print(f"❌ Metodo email non supportato: {method} (usa 'sendgrid' o 'smtp')", file=sys.stderr)
+        print(f"❌ Metodo email non supportato: {method} (usa 'sendgrid', 'smtp2go_api' o 'smtp')", file=sys.stderr)
         sys.exit(7)
 
 
