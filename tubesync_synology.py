@@ -56,14 +56,12 @@ class SynologyLogHandler(logging.Handler):
             level = self.LEVEL_MAP.get(record.levelno, "info")
             msg = self.format(record)
             full = f"{self.program}: {msg}"
-            # Esempio: /usr/syno/bin/synologset1 sys info 0x11100000 "TubeSync: message"
             subprocess.run(
                 ["/usr/syno/bin/synologset1", "sys", level, self.event_hex, full],
                 check=False
             )
         except Exception:
-            # Non solleva: lascia a fallback syslog/console
-            pass
+            pass  # fallback agli altri handler
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -180,7 +178,7 @@ def db_upsert(con, path: Path, size, mtime, sha1, status, video_id=None, error=N
     con.commit()
 
 # -------------------------
-# Email
+# Email (SMTP / SendGrid / SMTP2GO API)
 # -------------------------
 
 def send_email(cfg: ConfigParser, subject: str, body: str):
@@ -196,6 +194,37 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
     from_email = cfg.get("email", "from_email")
     to_email   = cfg.get("email", "to_email")
 
+    # --- SMTP2GO via API HTTP ---
+    if method == "smtp2go_api":
+        import requests
+        api_key = cfg.get("email", "smtp2go_api_key", fallback=None)
+        api_url = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
+        if not api_key:
+            logging.error("SMTP2GO API: manca 'smtp2go_api_key' in [email]")
+            return
+        payload = {
+            "api_key": api_key,
+            "to": [to_email],
+            "sender": from_email,
+            "subject": subject or (subj_prefix + " Notification"),
+            "text_body": body or "",
+        }
+        try:
+            r = requests.post(api_url, json=payload, timeout=30)
+            if r.status_code != 200:
+                logging.error(f"SMTP2GO API error HTTP {r.status_code}: {r.text}")
+                return
+            data = r.json()
+            # esito: data.succeeded == 1
+            if data.get("data", {}).get("succeeded") != 1:
+                logging.error(f"SMTP2GO API response: {r.text}")
+            else:
+                logging.info("Email inviata via SMTP2GO API")
+        except Exception as e:
+            logging.error(f"Errore invio email via SMTP2GO API: {e}")
+        return
+
+    # --- SendGrid via API ---
     if method == "sendgrid":
         if not SendGridAPIClient:
             logging.error("SendGrid non disponibile: esegui 'pip install sendgrid'")
@@ -205,7 +234,7 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
             logging.error("SendGrid: manca 'sendgrid_api_key' in [email]")
             return
         try:
-            message = Mail(from_email=from_email, to_emails=to_email, subject=subject, plain_text_content=body)
+            message = Mail(from_email=from_email, to_emails=to_email, subject=subject, plain_text_content=body or "")
             sg = SendGridAPIClient(api_key)
             resp = sg.send(message)
             logging.info(f"Email inviata via SendGrid (status={resp.status_code})")
@@ -213,7 +242,7 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
             logging.error(f"Errore invio email via SendGrid: {e}")
         return
 
-    # Default: SMTP tradizionale
+    # --- SMTP classico (default) ---
     host = cfg.get("email", "smtp_host", fallback="localhost")
     port = cfg.getint("email", "smtp_port", fallback=25)
     use_tls = cfg.getboolean("email", "use_tls", fallback=False)
@@ -221,8 +250,8 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
     user = cfg.get("email", "username", fallback=None)
     pwd  = cfg.get("email", "password", fallback=None)
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
+    msg = MIMEText(body or "", "plain", "utf-8")
+    msg["Subject"] = subject or (subj_prefix + " Notification")
     msg["From"] = from_email
     msg["To"] = to_email
     msg["Date"] = formatdate(localtime=True)
@@ -344,7 +373,6 @@ def resumable_upload(youtube, cfg: ConfigParser, file_path: Path, title: str, de
             "selfDeclaredMadeForKids": made_for_kids
         }
     }
-    # ripulisci campi None
     body["snippet"] = {k: v for k, v in body["snippet"].items() if v is not None}
 
     media = MediaFileUpload(str(file_path), chunksize=chunk_mb * 1024 * 1024, resumable=True)
@@ -453,7 +481,6 @@ def main():
 
     # mail
     to_email    = cfg.get("email", "to_email", fallback=None)
-    subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
 
     # pausa?
     paused_until = check_pause(cfg)
@@ -534,8 +561,7 @@ def main():
                     f"Lo script va in PAUSA per {cooldown_min} minuti (fino a {when}).\n"
                     f"Nessun altro file verrà processato in questo run.")
             send_email(cfg, subject, body)
-            # stop immediato: riprenderà il watcher al successivo trigger/rescan
-            return
+            return  # stop immediato: riprenderà il watcher al successivo trigger/rescan
 
         except Exception as e:
             count_errors += 1
