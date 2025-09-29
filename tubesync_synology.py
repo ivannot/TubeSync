@@ -165,70 +165,66 @@ def db_upsert(con, path: Path, size, mtime, sha1, status, video_id=None, error=N
 def send_email(cfg: ConfigParser, subject: str, body: str):
     if not cfg.getboolean("email", "enabled", fallback=False):
         return
-    method = cfg.get("email", "method", fallback="smtp").strip().lower()
-    from_email = cfg.get("email", "from_email")
-    to_email = cfg.get("email", "to_email")
 
-    # Messaggio
+    method = cfg.get("email", "method", fallback=None)
+    mode = cfg.get("email", "mode", fallback=None)
+    mode = (method or mode or "smtp").strip().lower()
+
+    from_email = cfg.get("email", "from_email")
+    to_email   = cfg.get("email", "to_email")
+
+    if mode == "smtp2go_api":
+        import json, urllib.request
+        api_key = cfg.get("email", "smtp2go_api_key", fallback=None)
+        api_url = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
+        if not api_key:
+            logging.error("SMTP2GO_API: api_key mancante in config.ini [email]")
+            return
+        payload = {
+            "api_key": api_key,
+            "to":      [to_email],
+            "sender":  from_email,
+            "subject": subject,
+            "text_body": body
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(api_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                logging.info(f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
+        except Exception as e:
+            logging.error(f"SMTP2GO_API: errore invio email: {e}")
+        return
+
+    # Fallback SMTP classico
+    host = cfg.get("email", "smtp_host", fallback="127.0.0.1")
+    port = cfg.getint("email", "smtp_port", fallback=587)
+    use_tls = cfg.getboolean("email", "use_tls", fallback=True)
+    use_ssl = cfg.getboolean("email", "use_ssl", fallback=False)
+    user = cfg.get("email", "username", fallback=None)
+    pwd  = cfg.get("email", "password", fallback=None)
+
+    from email.mime.text import MIMEText
+    from email.utils import formatdate
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = to_email
     msg["Date"] = formatdate(localtime=True)
 
-    if method == "sendgrid":
-        import requests
-        api_key = cfg.get("email", "sendgrid_api_key")
-        payload = {
-            "personalizations": [{"to": [{"email": to_email}]}],
-            "from": {"email": from_email},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body}],
-        }
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        try:
-            r = requests.post("https://api.sendgrid.com/v3/mail/send", headers=headers, json=payload, timeout=15)
-            if r.status_code >= 300:
-                logging.error(f"SendGrid error {r.status_code}: {r.text}")
-        except Exception as e:
-            logging.error(f"SendGrid exception: {e}")
-        return
-
-    if method == "smtp2go":
-        import requests
-        api_key = cfg.get("email", "smtp2go_api_key")
-        payload = {
-            "api_key": api_key,
-            "to": [to_email],
-            "sender": from_email,
-            "subject": subject,
-            "text_body": body,
-        }
-        try:
-            r = requests.post("https://api.smtp2go.com/v3/email/send", json=payload, timeout=15)
-            if r.status_code != 200:
-                logging.error(f"SMTP2GO error {r.status_code}: {r.text}")
-        except Exception as e:
-            logging.error(f"SMTP2GO exception: {e}")
-        return
-
-    # SMTP classico
-    host = cfg.get("email", "smtp_host")
-    port = cfg.getint("email", "smtp_port", fallback=587)
-    use_tls = cfg.getboolean("email", "use_tls", fallback=True)
-    use_ssl = cfg.getboolean("email", "use_ssl", fallback=False)
-    user = cfg.get("email", "username", fallback=None)
-    pwd = cfg.get("email", "password", fallback=None)
-
-    if use_ssl:
-        with smtplib.SMTP_SSL(host, port, timeout=30) as s:
-            if user and pwd: s.login(user, pwd)
-            s.sendmail(from_email, [to_email], msg.as_string())
-    else:
-        with smtplib.SMTP(host, port, timeout=30) as s:
-            if use_tls: s.starttls()
-            if user and pwd: s.login(user, pwd)
-            s.sendmail(from_email, [to_email], msg.as_string())
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                if user and pwd: s.login(user, pwd)
+                s.sendmail(from_email, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as s:
+                if use_tls: s.starttls()
+                if user and pwd: s.login(user, pwd)
+                s.sendmail(from_email, [to_email], msg.as_string())
+        logging.info("SMTP: mail inviata con successo.")
+    except Exception as e:
+        logging.error(f"SMTP: errore invio email: {e}")
 
 # -------------------------
 # YouTube helpers
