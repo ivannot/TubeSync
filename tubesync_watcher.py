@@ -4,34 +4,26 @@
 import sys, os, time, logging, logging.handlers, subprocess, threading
 from pathlib import Path
 from configparser import ConfigParser
-from queue import Queue, Empty
-from typing import Tuple  # <- ✅ compatibilità Py3.8
+from typing import Optional
+
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# -------------------------
-# Logging (Synology first)
-# -------------------------
-
+# ---------- Logging su Synology + console opzionale ----------
 class SynologyLogHandler(logging.Handler):
-    """Invia al Log Center usando synologset1 con argomenti corretti."""
     LEVEL_MAP = {
         logging.CRITICAL: "err",
         logging.ERROR:    "err",
         logging.WARNING:  "warn",
         logging.INFO:     "info",
-        logging.DEBUG:    "info",   # Synology non ha 'debug': declasso a info
+        logging.DEBUG:    "debug",
     }
     def __init__(self, program="TubeSyncWatcher"):
         super().__init__()
         self.program = program
-        # Normalizza in *0x + 8 cifre uppercase*
-        raw = os.getenv("TS_EVENT_HEX", "0x11100000")
-        hex_only = raw.upper().replace("0X", "")
-        hex_only = (hex_only + "00000000")[:8]
-        self.event_id = "0x" + hex_only
+        self.event_hex = os.getenv("TS_EVENT_HEX", "0x11100000")
 
     def emit(self, record):
         try:
@@ -39,7 +31,7 @@ class SynologyLogHandler(logging.Handler):
             msg = self.format(record)
             full = f"{self.program}: {msg}"
             subprocess.run(
-                ["/usr/syno/bin/synologset1", "sys", level, self.event_id, full],
+                ["/usr/syno/bin/synologset1", "sys", level, self.event_hex, full],
                 check=False
             )
         except Exception:
@@ -47,244 +39,225 @@ class SynologyLogHandler(logging.Handler):
 
 def setup_logging():
     handlers = [SynologyLogHandler(program="TubeSyncWatcher")]
-    if os.getenv("TS_FILE"):
-        handlers.append(logging.FileHandler(os.getenv("TS_FILE")))
+    try:
+        if os.path.exists("/dev/log"):
+            handlers.append(logging.handlers.SysLogHandler(address="/dev/log"))
+    except Exception:
+        pass
     if os.getenv("TS_CONSOLE") == "1":
         handlers.append(logging.StreamHandler())
     fmt = logging.Formatter("TubeSyncWatcher[%(process)d]: [%(levelname)s] %(message)s")
     for h in handlers: h.setFormatter(fmt)
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
     logging.basicConfig(level=logging.INFO, handlers=handlers)
 
-# -------------------------
-# Config helpers
-# -------------------------
-
+# ---------- Config ----------
 def load_config(cfg_path: Path) -> ConfigParser:
-    cfg = ConfigParser(inline_comment_prefixes=(';', '#'))
+    cfg = ConfigParser(inline_comment_prefixes=('#', ';'))
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
     cfg.read(cfg_path)
     return cfg
 
-def get_path_from_cfg(cfg: ConfigParser, section: str, option: str, default_rel: str) -> Path:
-    if cfg.has_option(section, option):
-        v = cfg.get(section, option)
-        p = Path(v)
-        if not p.is_absolute():
-            p = (SCRIPT_DIR / v)
-        return p.expanduser().resolve()
-    return (SCRIPT_DIR / default_rel).resolve()
+def cfg_paths(cfg: ConfigParser):
+    # percorsi relativi risolti rispetto alla cartella dello script
+    def getp(section, option, default_rel) -> Path:
+        if cfg.has_option(section, option):
+            return Path(cfg.get(section, option)).expanduser().resolve()
+        return (SCRIPT_DIR / default_rel).resolve()
+    return {
+        "client_secret": getp("general", "client_secret_path", "client_secret.json"),
+        "token":         getp("general", "token_path", "token.json"),
+        "db":            getp("general", "db_path", "state.db"),
+        "log":           getp("general", "log_path", "tubesync.log"),
+        "pause":         getp("general", "pause_file", ".pause_until"),
+    }
 
-# -------------------------
-# Pause helpers (quota)
-# -------------------------
+# ---------- Utility ----------
+def parse_allowed_exts(cfg: ConfigParser):
+    raw = cfg.get("general", "allowed_extensions", fallback=".mp4,.mov,.m4v,.avi,.mkv")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-def read_pause_until(cfg: ConfigParser) -> float:
-    pf = get_path_from_cfg(cfg, "general", "pause_file", ".pause_until")
-    if not pf.exists():
-        return 0.0
+def is_allowed_ext(path: Path, allowed_exts: set) -> bool:
+    return path.suffix.lower() in allowed_exts
+
+def run_uploader(cfg_path: Path):
+    # usa lo stesso interprete del watcher
+    python = sys.executable
+    cmd = [str(python), str(SCRIPT_DIR / "tubesync_synology.py"), str(cfg_path)]
+    logging.info(f"Esecuzione comando: {' '.join(cmd)}")
     try:
-        return float(pf.read_text().strip())
-    except Exception:
-        try:
-            pf.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return 0.0
-
-def clear_expired_pause_if_any(cfg: ConfigParser) -> bool:
-    """True se c'era una pausa scaduta che ho rimosso ora."""
-    pf = get_path_from_cfg(cfg, "general", "pause_file", ".pause_until")
-    if pf.exists():
-        try:
-            until = float(pf.read_text().strip())
-        except Exception:
-            pf.unlink(missing_ok=True)
-            return True
-        if time.time() >= until:
-            pf.unlink(missing_ok=True)
-            return True
-    return False
-
-def pause_active(cfg: ConfigParser) -> Tuple[bool, float]:  # <- ✅ Tuple
-    until = read_pause_until(cfg)
-    return (time.time() < until, until)
-
-# -------------------------
-# Uploader runner
-# -------------------------
-
-def uploader_is_running(uploader_path: Path) -> bool:
-    try:
-        out = subprocess.check_output(["pgrep", "-af", str(uploader_path)], text=True)
-        lines = [ln for ln in out.strip().splitlines() if "python" in ln or "python3" in ln]
-        return len(lines) > 0
-    except subprocess.CalledProcessError:
-        return False
-
-def run_uploader(cfg_path: Path, uploader_path: Path):
-    if uploader_is_running(uploader_path):
-        logging.info("Uploader già in esecuzione: skip.")
-        return
-    logging.info(f"Esecuzione comando: {sys.executable} {uploader_path} {cfg_path}")
-    try:
-        rc = subprocess.call([sys.executable, str(uploader_path), str(cfg_path)])
-        logging.info(f"Comando terminato con exit code {rc}.")
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            logging.error(f"Uploader terminato con exit code {rc}")
+        else:
+            logging.info("Uploader completato.")
     except Exception as e:
         logging.error(f"Impossibile eseguire uploader: {e}")
 
-# -------------------------
-# Watchdog handler con debounce
-# -------------------------
+def pause_active(pause_file: Path) -> Optional[float]:
+    if not pause_file.exists():
+        return None
+    try:
+        until = float(pause_file.read_text().strip())
+    except Exception:
+        return None
+    if time.time() < until:
+        return until
+    # scaduta: rimuovi
+    try:
+        pause_file.unlink()
+    except Exception:
+        pass
+    return None
 
+# ---------- Watcher ----------
 class DebouncedHandler(FileSystemEventHandler):
-    def __init__(self, q: Queue, allowed_exts: set):
+    def __init__(self, cfg: ConfigParser, cfg_path: Path):
         super().__init__()
-        self.q = q
-        self.allowed_exts = allowed_exts
+        self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.allowed_exts = parse_allowed_exts(cfg)
 
-    def _interesting(self, path: Path) -> bool:
-        return path.suffix.lower() in self.allowed_exts
+        self.debounce_seconds = cfg.getint("watcher", "debounce_seconds", fallback=300)
+        self.settle_seconds = cfg.getint("watcher", "settle_seconds", fallback=60)
+        self.max_debounce_seconds = cfg.getint("watcher", "max_debounce_seconds", fallback=900)
+        self.pause_check_seconds = cfg.getint("watcher", "pause_check_seconds", fallback=30)
 
-    def on_created(self, event):
-        if not event.is_directory and self._interesting(Path(event.src_path)):
-            self.q.put(("fs", time.time()))
+        self._timer: Optional[threading.Timer] = None
+        self._first_event_ts: Optional[float] = None
+        self._last_touch: dict[str, float] = {}
 
-    def on_moved(self, event):
-        if not event.is_directory and self._interesting(Path(event.dest_path)):
-            self.q.put(("fs", time.time()))
+        self._lock = threading.Lock()
+        self._stop = False
 
-    def on_modified(self, event):
-        if not event.is_directory and self._interesting(Path(event.src_path)):
-            self.q.put(("fs", time.time()))
+        self._pause_file = cfg_paths(cfg)["pause"]
 
-# -------------------------
-# Main watcher loop
-# -------------------------
+    def on_any_event(self, event: FileSystemEvent):
+        if event.is_directory:
+            return
+        p = Path(event.src_path)
+        if not is_allowed_ext(p, self.allowed_exts):
+            return
+
+        with self._lock:
+            now = time.time()
+            self._last_touch[str(p)] = now
+            if self._first_event_ts is None:
+                self._first_event_ts = now
+            logging.info(f"Evento FS → debounce {self.debounce_seconds}s (reason=filesystem).")
+            self._schedule()
+
+    def _schedule(self):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.debounce_seconds, self._deferred_trigger)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _all_settled(self) -> bool:
+        if self.settle_seconds <= 0:
+            return True
+        now = time.time()
+        # tutti i file visti devono essere “fermi” da almeno settle_seconds
+        for _p, ts in self._last_touch.items():
+            if now - ts < self.settle_seconds:
+                return False
+        return True
+
+    def _deferred_trigger(self):
+        with self._lock:
+            if self._stop:
+                return
+            # quota in corso?
+            paused_until = pause_active(self._pause_file)
+            if paused_until:
+                when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(paused_until))
+                logging.info(f"In pausa fino a {when} — rimando trigger.")
+                self._schedule()
+                return
+
+            now = time.time()
+            # forza se si supera il max debounce
+            if self._first_event_ts and (now - self._first_event_ts >= self.max_debounce_seconds):
+                self._fire("max_debounce")
+                return
+
+            # aspetta che i file si stabilizzino
+            if not self._all_settled():
+                self._schedule()
+                return
+
+            self._fire("filesystem")
+
+    def _fire(self, reason: str):
+        self._timer = None
+        self._first_event_ts = None
+        self._last_touch.clear()
+        logging.info(f"Trigger '{reason}': lancio uploader.")
+        run_uploader(self.cfg_path)
+
+    def stop(self):
+        with self._lock:
+            self._stop = True
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
 
 def main():
     setup_logging()
 
-    cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else (SCRIPT_DIR / "config.ini")
+    cfg_path = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (SCRIPT_DIR / "config.ini").resolve()
     cfg = load_config(cfg_path)
 
-    # roots
+    # sorgenti
     if not cfg.has_option("general", "source_dirs"):
-        logging.error("Nessuna root valida: mancano [general].source_dirs")
+        logging.error("Nessuna root valida da osservare. Esco..")
         sys.exit(2)
-
-    roots = [s.strip() for s in cfg.get("general", "source_dirs").split(",") if s.strip()]
-    roots = [Path(r).expanduser() for r in roots if Path(r).expanduser().exists()]
+    roots = [Path(s.strip()).expanduser().resolve() for s in cfg.get("general", "source_dirs").split(",") if s.strip()]
+    roots = [r for r in roots if r.exists()]
     if not roots:
         logging.error("Nessuna root valida da osservare. Esco..")
         sys.exit(2)
 
-    # estensioni
-    allowed = [e.strip().lower() for e in cfg.get("general", "allowed_extensions",
-                                                  fallback=".mp4,.mov,.m4v,.avi,.mkv").split(",")]
-    allowed_exts = set(allowed)
+    handler = DebouncedHandler(cfg, cfg_path)
 
-    # debounce & schedulazioni
-    debounce_sec = cfg.getint("watcher", "debounce_seconds", fallback=90)
-    rescan_minutes = cfg.getint("watcher", "rescan_minutes", fallback=60)
-    pause_check_seconds = cfg.getint("watcher", "pause_check_seconds", fallback=30)
+    # se la pausa è SCADUTA all'avvio, rimuovi file e lancia subito un massivo
+    pause_file = cfg_paths(cfg)["pause"]
+    if pause_file.exists():
+        paused_until = pause_active(pause_file)
+        if paused_until is None and not pause_file.exists():
+            logging.info("Pausa scaduta rilevata all'avvio: file rimosso, lancio run iniziale.")
+            run_uploader(cfg_path)
 
-    uploader_path = (SCRIPT_DIR / "tubesync_synology.py").resolve()
-
-    # coda eventi + timer debounce
-    q: Queue = Queue()
-    timer_lock = threading.Lock()
-    debounce_timer = None  # type: threading.Timer
-
-    def trigger_run(reason: str):
-        active, until = pause_active(cfg)
-        if active:
-            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-            logging.info(f"Trigger '{reason}': pausa attiva fino a {when}, non lancio.")
-            return
-        logging.info(f"Trigger '{reason}': lancio uploader.")
-        run_uploader(cfg_path, uploader_path)
-
-    def start_debounce(reason: str):
-        nonlocal debounce_timer
-        with timer_lock:
-            if debounce_timer and debounce_timer.is_alive():
-                debounce_timer.cancel()
-            logging.info(f"Evento FS → debounce {debounce_sec}s (reason={reason})")
-            debounce_timer = threading.Timer(debounce_sec, trigger_run, args=(reason,))
-            debounce_timer.daemon = True
-            debounce_timer.start()
-
-    # watchdog setup
-    event_handler = DebouncedHandler(q, allowed_exts)
-    observer = Observer()
+    # avvia observer
+    obs = Observer()
     for r in roots:
-        observer.schedule(event_handler, str(r), recursive=True)
         logging.info(f"Osservo: {r}")
-    observer.start()
+        obs.schedule(handler, str(r), recursive=True)
+    obs.start()
 
-    # se la pausa è scaduta al boot, rimuovila e lancia subito
-    if clear_expired_pause_if_any(cfg):
-        logging.info("Pausa scaduta rilevata all'avvio: file rimosso, lancio run iniziale.")
+    # rescan periodico
+    rescan_minutes = cfg.getint("watcher", "rescan_minutes", fallback=60)
 
-    # run iniziale
-    trigger_run("initial_scan")
-
-    # consumer eventi FS
-    def consumer():
-        while True:
-            try:
-                _evt, _ts = q.get(timeout=1.0)
-            except Empty:
-                continue
-            start_debounce("filesystem")
-
-    threading.Thread(target=consumer, daemon=True).start()
-
-    # controllo scadenza pausa
-    def pause_watcher():
-        last_active = None
-        while True:
-            active, until = pause_active(cfg)
-            if active:
-                if last_active is not True:
-                    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-                    logging.info(f"Pausa attiva (quota) fino a {when}.")
-                last_active = True
-            else:
-                if last_active:
-                    logging.info("Pausa terminata: lancio run per recuperare i pending.")
-                    trigger_run("pause_expired")
-                last_active = False
-            time.sleep(max(1, pause_check_seconds))
-
-    threading.Thread(target=pause_watcher, daemon=True).start()
-
-    # rescan periodico (opzionale)
-    def periodic_rescan():
-        if rescan_minutes <= 0:
-            return
-        interval = max(1, rescan_minutes) * 60
-        while True:
-            time.sleep(interval)
-            logging.info("Rescan periodico: lancio run.")
-            trigger_run("periodic_rescan")
-
-    threading.Thread(target=periodic_rescan, daemon=True).start()
-
-    logging.info("TubeSync Watcher attivo. In attesa di eventi..")
     try:
+        last_rescan = 0.0
         while True:
-            time.sleep(5)
+            time.sleep(1)
+            if rescan_minutes > 0:
+                now = time.time()
+                if now - last_rescan >= rescan_minutes * 60:
+                    # se non in pausa, lancia run massivo
+                    if not pause_active(pause_file):
+                        logging.info("Trigger 'periodic_rescan': lancio uploader.")
+                        run_uploader(cfg_path)
+                    last_rescan = now
     except KeyboardInterrupt:
         pass
     finally:
-        observer.stop()
-        observer.join()
-        logging.info("Watcher terminato.")
+        handler.stop()
+        obs.stop()
+        obs.join(timeout=5)
 
 if __name__ == "__main__":
     main()
