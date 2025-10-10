@@ -7,6 +7,7 @@ PYTHON="/volume2/TubeSync/.venv/bin/python3"
 WATCHER="/volume2/TubeSync/tubesync_watcher.py"
 CONFIG="/volume2/TubeSync/config.ini"
 PIDFILE="/volume2/TubeSync/tubesync_watcher.pid"
+ERRORFILE="/volume2/TubeSync/.error_lock"
 
 # Funzione per loggare su Log Center (metodo testato e funzionante)
 syno_log() {
@@ -19,6 +20,13 @@ start() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "⚠️  TubeSync Watcher already running (pid=$(cat "$PIDFILE"))"
         exit 0
+    fi
+
+    # Rimuovi il file di errore al restart (permette di riprovare dopo aver corretto il problema)
+    if [ -f "$ERRORFILE" ]; then
+        echo "🔓 Rimozione lock errore precedente..."
+        rm -f "$ERRORFILE"
+        syno_log "info" "Lock errore rimosso - riavvio dopo correzione"
     fi
 
     echo "✅ Starting TubeSync Watcher..."
@@ -44,6 +52,17 @@ stop() {
 status() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "✅ TubeSync Watcher is running (pid=$(cat "$PIDFILE"))"
+        
+        # Controlla se c'è un errore critico attivo
+        if [ -f "$ERRORFILE" ]; then
+            echo "⚠️  ⚠️  ⚠️  ATTENZIONE: Esecuzioni sospese a causa di errore critico! ⚠️  ⚠️  ⚠️"
+            echo ""
+            cat "$ERRORFILE"
+            echo ""
+            echo "Per risolvere:"
+            echo "  1. Correggi il problema (es. rigenera il token YouTube)"
+            echo "  2. Riavvia il servizio con: ./tubesync.sh restart"
+        fi
     else
         echo "⚠️  TubeSync Watcher is not running."
     fi
@@ -55,10 +74,23 @@ restart() {
     start
 }
 
+clear_error() {
+    if [ -f "$ERRORFILE" ]; then
+        echo "🔓 Rimozione lock errore..."
+        cat "$ERRORFILE"
+        rm -f "$ERRORFILE"
+        syno_log "info" "Lock errore rimosso manualmente"
+        echo "✅ Lock errore rimosso. Il watcher riprenderà le esecuzioni."
+    else
+        echo "ℹ️  Nessun lock errore presente."
+    fi
+}
+
 case "$1" in
     start) start ;;
     stop) stop ;;
     restart) restart ;;
     status) status ;;
-    *) echo "Usage: $0 {start|stop|restart|status}" ;;
+    clear-error) clear_error ;;
+    *) echo "Usage: $0 {start|stop|restart|status|clear-error}" ;;
 esac
