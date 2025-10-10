@@ -105,6 +105,19 @@ class DebouncedRunner:
                 self._timer.start()
 
     def _run(self):
+        # Controlla se c'è un file di errore critico
+        error_file = Path("/volume2/TubeSync/.error_lock")
+        if error_file.exists():
+            with open(error_file, "r") as f:
+                error_msg = f.read().strip()
+            msg = f"Esecuzione sospesa a causa di errore critico: {error_msg}"
+            self.log.warning(msg)
+            # Log solo ogni ora per non spammare
+            if not hasattr(self, '_last_error_log') or (time.time() - self._last_error_log) > 3600:
+                syno_log_warn("SUSPENDED", "Esecuzione sospesa - errore critico attivo. Risolvi e riavvia il servizio")
+                self._last_error_log = time.time()
+            return
+        
         msg = f"Esecuzione uploader: {' '.join(self.cmd)}"
         self.log.info(msg)
         syno_log_info("UPLOAD", msg)
@@ -113,7 +126,20 @@ class DebouncedRunner:
             code = proc.wait()
             msg2 = f"Uploader terminato con exit code {code}"
             self.log.info(msg2)
-            syno_log_info("UPLOAD", msg2)
+            
+            # Exit code 2 = errore di autenticazione
+            if code == 2:
+                error_msg = "Errore autenticazione YouTube (token scaduto?)"
+                self.log.error(error_msg)
+                syno_log_err("AUTH_FAIL", error_msg)
+                # Crea file di lock per sospendere future esecuzioni
+                with open(error_file, "w") as f:
+                    f.write(f"{error_msg}\nTimestamp: {time.strftime('%F %T')}\n")
+                syno_log_err("SUSPENDED", "Esecuzioni sospese fino a risoluzione. Riavvia il servizio dopo aver corretto il token")
+            elif code == 0:
+                syno_log_info("UPLOAD", "Uploader completato con successo")
+            else:
+                syno_log_warn("UPLOAD", f"Uploader terminato con exit code {code}")
         except Exception as e:
             self.log.exception(f"Errore esecuzione uploader: {e}")
             syno_log_err("UPLOAD_ERR", f"Errore esecuzione uploader: {e}")
