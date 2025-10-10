@@ -1,85 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, os, time, json, hashlib, logging, logging.handlers, subprocess, traceback
-import sqlite3, smtplib
-from email.mime.text import MIMEText
-from email.utils import formatdate
+import sys, time, json, hashlib, logging, logging.handlers, sqlite3, smtplib, traceback, os, socket
 from pathlib import Path
 from configparser import ConfigParser
+from email.mime.text import MIMEText
+from email.utils import formatdate
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError, ResumableUploadError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 
-# ---- OAuth scopes: upload + read-only (idratazione/verifica) ----
+# --------- Costanti ---------
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
+PAUSE_FILE = Path("/volume2/TubeSync/.auth_paused")
 
-class QuotaExceeded(Exception):
-    pass
-
-# -------------------------
-# Logging (Synology first)
-# -------------------------
-class SynologyLogHandler(logging.Handler):
-    LEVEL_MAP = {
-        logging.CRITICAL: "crit",
-        logging.ERROR:    "err",
-        logging.WARNING:  "warning",
-        logging.INFO:     "info",
-        logging.DEBUG:    "debug",
-    }
-    def __init__(self, program="TubeSyncUploader"):
-        super().__init__()
-        self.program = program
-        self.event_hex = os.getenv("TS_EVENT_HEX", "0x11100000")
-
-    def emit(self, record):
-        try:
-            level = self.LEVEL_MAP.get(record.levelno, "info")
-            msg = self.format(record)
-            full = f"{self.program}: {msg}"
-            subprocess.run(
-                ["/usr/syno/bin/synologset1", "sys", level, self.event_hex, full],
-                check=False
-            )
-        except Exception:
-            pass
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-def setup_logging():
-    handlers = [SynologyLogHandler(program="TubeSyncUploader")]
-    # Fallback syslog locale
-    try:
-        sock = "/dev/log" if os.path.exists("/dev/log") else ("/run/systemd/journal/dev-log" if os.path.exists("/run/systemd/journal/dev-log") else None)
-        if sock:
-            handlers.append(logging.handlers.SysLogHandler(address=sock, facility=logging.handlers.SysLogHandler.LOG_LOCAL0))
-    except Exception:
-        pass
-    # Opzioni debug opzionali
-    if os.getenv("TS_FILE"):
-        try: handlers.append(logging.FileHandler(os.getenv("TS_FILE")))
-        except Exception: pass
-    if os.getenv("TS_CONSOLE") == "1":
-        handlers.append(logging.StreamHandler())
-
-    fmt = logging.Formatter("TubeSyncUploader[%(process)d]: [%(levelname)s] %(message)s")
-    for h in handlers: h.setFormatter(fmt)
-
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-
-# -------------------------
-# Config & util
-# -------------------------
+# --------- Config & logging ---------
 def load_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
@@ -88,10 +31,34 @@ def load_config(cfg_path: Path) -> ConfigParser:
     cfg.read(cfg_path)
     return cfg
 
-def get_path_from_cfg(cfg: ConfigParser, section: str, option: str, default_rel: str) -> Path:
-    if cfg.has_option(section, option):
-        return Path(cfg.get(section, option)).expanduser().resolve()
-    return (SCRIPT_DIR / default_rel).resolve()
+def setup_logging(_: Path):
+    # Syslog → Log Center, con fallback UDP 127.0.0.1:514 e infine stdout
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+
+    handlers = []
+    syslog_socket = "/dev/log" if os.path.exists("/dev/log") else ("/run/log" if os.path.exists("/run/log") else None)
+    if syslog_socket:
+        try:
+            h = logging.handlers.SysLogHandler(address=syslog_socket, facility=logging.handlers.SysLogHandler.LOG_USER)
+            handlers.append(h)
+        except Exception:
+            pass
+    if not handlers:
+        try:
+            h = logging.handlers.SysLogHandler(address=("127.0.0.1", 514),
+                                               facility=logging.handlers.SysLogHandler.LOG_USER,
+                                               socktype=socket.SOCK_DGRAM)
+            handlers.append(h)
+        except Exception:
+            pass
+    if not handlers:
+        handlers = [logging.StreamHandler()]
+
+    fmt = logging.Formatter("TubeSyncUploader[%(process)d]: [%(levelname)s] %(message)s")
+    for h in handlers:
+        h.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
 
 def ensure_db(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +80,14 @@ def ensure_db(db_path: Path):
     con.execute("CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status)")
     con.commit()
     return con
+
+# --------- Utils ---------
+def write_pause_file(reason: str):
+    try:
+        with open(PAUSE_FILE, "w") as f:
+            f.write(f"PAUSED AT {time.strftime('%Y-%m-%d %H:%M:%S')}\n{reason}\n")
+    except Exception:
+        pass
 
 def sha1_of_file(p: Path, block=1024*1024):
     h = hashlib.sha1()
@@ -148,20 +123,35 @@ def db_get(con, path: Path):
 
 def db_upsert(con, path: Path, size, mtime, sha1, status, video_id=None, error=None):
     now = time.time()
-    con.execute("""
-        INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET
-            size=excluded.size,
-            mtime=excluded.mtime,
-            sha1=excluded.sha1,
-            status=excluded.status,
-            video_id=excluded.video_id,
-            error=excluded.error,
-            updated_at=excluded.updated_at
-    """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
-    con.commit()
+    try:
+        con.execute("""
+            INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size=excluded.size,
+                mtime=excluded.mtime,
+                sha1=excluded.sha1,
+                status=excluded.status,
+                video_id=excluded.video_id,
+                error=excluded.error,
+                updated_at=excluded.updated_at
+        """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
+        con.commit()
+    except sqlite3.OperationalError:
+        cur = con.execute("SELECT 1 FROM uploads WHERE path = ?", (str(path),))
+        if cur.fetchone():
+            con.execute("""
+                UPDATE uploads SET size=?, mtime=?, sha1=?, status=?, video_id=?, error=?, updated_at=?
+                WHERE path=?
+            """, (size, mtime, sha1, status, video_id, error, now, str(path)))
+        else:
+            con.execute("""
+                INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
+        con.commit()
 
+# --------- Email (SMTP2GO API / SMTP) ---------
 def send_email(cfg: ConfigParser, subject: str, body: str):
     if not cfg.getboolean("email", "enabled", fallback=False):
         return
@@ -174,7 +164,7 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
     to_email   = cfg.get("email", "to_email")
 
     if mode == "smtp2go_api":
-        import json, urllib.request
+        import json as _json, urllib.request as _ur
         api_key = cfg.get("email", "smtp2go_api_key", fallback=None)
         api_url = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
         if not api_key:
@@ -187,10 +177,10 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
             "subject": subject,
             "text_body": body
         }
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(api_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        data = _json.dumps(payload).encode("utf-8")
+        req = _ur.Request(api_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _ur.urlopen(req, timeout=20) as resp:
                 logging.info(f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
         except Exception as e:
             logging.error(f"SMTP2GO_API: errore invio email: {e}")
@@ -204,8 +194,6 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
     user = cfg.get("email", "username", fallback=None)
     pwd  = cfg.get("email", "password", fallback=None)
 
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = from_email
@@ -226,12 +214,10 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
     except Exception as e:
         logging.error(f"SMTP: errore invio email: {e}")
 
-# -------------------------
-# YouTube helpers
-# -------------------------
+# --------- YouTube auth & helpers ---------
 def get_authenticated_service(cfg: ConfigParser):
-    client_secret = get_path_from_cfg(cfg, "general", "client_secret_path", "client_secret.json")
-    token_path    = get_path_from_cfg(cfg, "general", "token_path", "token.json")
+    client_secret = Path(cfg.get("general", "client_secret_path")).expanduser()
+    token_path = Path(cfg.get("general", "token_path")).expanduser()
 
     if not client_secret.exists():
         raise FileNotFoundError(f"client_secret.json non trovato: {client_secret}")
@@ -242,19 +228,22 @@ def get_authenticated_service(cfg: ConfigParser):
             data = json.load(f)
         creds = Credentials.from_authorized_user_info(data, SCOPES)
 
+    # Tentativo refresh o richiesta re-auth (headless → fallo gestire esternamente)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                # Propaga: verrà gestito in main() con pausa
+                raise
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
+            # NAS headless: niente browser. Fallire e gestire in main().
+            raise RefreshError("no_valid_token", "Missing/expired token and no interactive login available")
 
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def fetch_existing_titles(youtube):
-    """Ritorna dict { titolo_lower: video_id } per tutta la playlist 'Uploads'."""
+    """Ritorna dict { titolo_lower: video_id } per tutti i video della playlist 'Uploads'."""
     titles = {}
     ch = youtube.channels().list(part="contentDetails", mine=True).execute()
     items = ch.get("items", [])
@@ -281,66 +270,15 @@ def fetch_existing_titles(youtube):
             break
     return titles
 
-def youtube_videos_exist(youtube, ids):
-    """Ritorna set di video_id che ESISTONO (videos.list part=snippet/status), input <=50 per batch."""
-    existing = set()
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i+50]
-        resp = youtube.videos().list(part="status", id=",".join(chunk)).execute()
-        for it in resp.get("items", []):
-            vid = it.get("id")
-            if vid:
-                existing.add(vid)
-    return existing
-
-def _parse_error_reasons(exc) -> set:
-    reasons = set()
-    content = None
-    try:
-        content = getattr(exc, "content", None)
-        if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="ignore")
-        if isinstance(content, str) and content:
-            obj = json.loads(content)
-            err = obj.get("error") or {}
-            errs = err.get("errors") or []
-            for e in errs:
-                r = (e.get("reason") or "").lower()
-                if r:
-                    reasons.add(r)
-            if not reasons and "details" in err:
-                for d in err["details"]:
-                    r = (d.get("reason") or "").lower()
-                    if r:
-                        reasons.add(r)
-    except Exception:
-        pass
-    try:
-        msg = str(exc)
-        for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded", "uploadlimitexceeded"):
-            if key in msg.lower():
-                reasons.add(key)
-    except Exception:
-        pass
-    return reasons
-
-def _is_quota_reason(reasons: set) -> bool:
-    for key in ("quotaexceeded", "userratelimitexceeded", "dailylimitexceeded", "uploadlimitexceeded"):
-        if key in reasons:
-            return True
-    return False
-
-def resumable_upload(youtube, file_path: Path, title: str, description: str, privacy: str, category_id: int, chunk_mb: int, max_retries: int, made_for_kids: bool):
+# --------- Upload ---------
+def resumable_upload(youtube, file_path: Path, title: str, description: str, privacy: str, category_id: int, chunk_mb: int, max_retries: int):
     body = {
         "snippet": {
             "title": title,
-            "description": description,
-            "categoryId": category_id,
+            "description": description or "",
+            "categoryId": str(category_id) if category_id else None
         },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": bool(made_for_kids)
-        }
+        "status": {"privacyStatus": privacy or "private"}
     }
     body["snippet"] = {k: v for k, v in body["snippet"].items() if v is not None}
 
@@ -362,24 +300,14 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str, pri
                     return response["id"]
                 else:
                     raise RuntimeError(f"Risposta inattesa API: {response}")
-
-        except (HttpError, ResumableUploadError) as e:
-            reasons = _parse_error_reasons(e)
-
-            # Stop immediato in caso di quota/rate limit/upload limit
-            sc = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
-            if (sc in (400, 403, 429)) and _is_quota_reason(reasons):
-                raise QuotaExceeded(",".join(sorted(reasons)) or "quotaExceeded") from e
-
-            # Retri per errori temporanei
-            if sc in (500, 502, 503, 504) and retry < max_retries:
+        except HttpError as e:
+            if e.resp.status in [500, 502, 503, 504] and retry < max_retries:
                 retry += 1
                 sleep_s = backoff ** retry
-                logging.warning(f"[{file_path.name}] Errore temporaneo {sc}, retry {retry}/{max_retries} tra {sleep_s}s")
+                logging.warning(f"[{file_path.name}] Errore temporaneo {e.resp.status}, retry {retry}/{max_retries} tra {sleep_s}s")
                 time.sleep(sleep_s)
                 continue
             raise
-
         except Exception as e:
             if retry < max_retries:
                 retry += 1
@@ -389,109 +317,68 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str, pri
                 continue
             raise
 
-# -------------------------
-# Pausa quota
-# -------------------------
-def get_pause_path(cfg: ConfigParser):
-    return get_path_from_cfg(cfg, "general", "pause_file", ".pause_until")
-
-def check_pause(cfg: ConfigParser):
-    pf = get_pause_path(cfg)
-    if pf.exists():
-        try:
-            until = float(pf.read_text().strip())
-            if time.time() < until:
-                return until
-            pf.unlink(missing_ok=True)
-        except Exception:
-            pf.unlink(missing_ok=True)
-    return None
-
-def set_pause(cfg: ConfigParser, minutes: int):
-    pf = get_pause_path(cfg)
-    pf.parent.mkdir(parents=True, exist_ok=True)
-    until = time.time() + max(1, int(minutes)) * 60
-    pf.write_text(str(until))
-    return until
-
-# -------------------------
-# Re-validate: rimetti pending se il video_id non esiste più
-# -------------------------
-def revalidate_done_entries(cfg: ConfigParser, con: sqlite3.Connection, youtube):
-    reupload_flag = cfg.getboolean("general", "reupload_if_missing_on_youtube", fallback=False)
-    if not reupload_flag:
-        return 0
-
-    cur = con.execute("SELECT path, video_id FROM uploads WHERE status='done' AND video_id IS NOT NULL")
-    rows = cur.fetchall()
-    if not rows:
-        return 0
-
-    ids = [vid for (_p, vid) in rows if vid]
-    # Batch 50
-    missing_total = 0
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i+50]
-        existing = youtube_videos_exist(youtube, chunk)
-        missing = set(chunk) - existing
-        if not missing:
-            continue
-        missing_total += len(missing)
-        # Mark pending those missing
-        for (p, vid) in rows:
-            if vid in missing:
-                try:
-                    st = Path(p).stat()
-                    size, mtime = st.st_size, st.st_mtime
-                except Exception:
-                    size = mtime = None
-                db_upsert(con, Path(p), size, mtime, None, "pending", None, "Missing on YouTube; scheduled for re-upload")
-                logging.info(f"[REUPLOAD] VideoID assente su YouTube → pending: {p} (was {vid})")
-
-    if missing_total:
-        logging.info(f"Re-validate: {missing_total} elementi segnati pending (rimossi da YouTube).")
-    else:
-        logging.info("Re-validate: nessun video mancante su YouTube.")
-    return missing_total
-
-# -------------------------
-# Main
-# -------------------------
+# --------- Main ---------
 def main():
-    cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else (SCRIPT_DIR / "config.ini")
+    cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("/volume2/TubeSync/config.ini")
     cfg = load_config(cfg_path)
-    setup_logging()
 
-    # pausa?
-    paused_until = check_pause(cfg)
-    if paused_until:
-        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(paused_until))
-        logging.warning(f"Pausa attiva fino a {when} per quota limit. Esco.")
+    # Rispetta pausa (manuale o impostata da auth failure)
+    if PAUSE_FILE.exists():
+        print(f"TubeSync in pausa: rimuovi {PAUSE_FILE} dopo aver risolto l'autenticazione.")
         return
 
-    # DB
-    db_path = get_path_from_cfg(cfg, "general", "db_path", "state.db")
-    con = ensure_db(db_path)
+    log_path = Path(cfg.get("general", "log_path", fallback="/volume2/TubeSync/tubesync.log")).expanduser()
+    setup_logging(log_path)
 
-    # auth
+    con = ensure_db(Path(cfg.get("general", "db_path", fallback="/volume2/TubeSync/state.db")).expanduser())
+
+    source_dirs = [s.strip() for s in cfg.get("general", "source_dirs").split(",") if s.strip()]
+    allowed_exts = [e.strip().lower() for e in cfg.get("general", "allowed_extensions").split(",")]
+    min_size_mb = cfg.getint("general", "skip_if_smaller_than_mb", fallback=5)
+    min_size_bytes = max(0, min_size_mb) * 1024 * 1024
+
+    privacy     = cfg.get("general", "privacy", fallback="private")
+    category_id = cfg.getint("general", "category_id", fallback=22)
+    description = cfg.get("general", "description", fallback="")
+    use_sha1    = cfg.getboolean("general", "use_sha1", fallback=False)
+    chunk_mb    = cfg.getint("general", "chunk_mb", fallback=8)
+    max_retries = cfg.getint("general", "max_retries", fallback=8)
+
+    hydrate       = cfg.getboolean("general", "hydrate_from_youtube_on_start", fallback=True)
+    hydrate_match = cfg.get("general", "hydrate_match", fallback="exact_title").strip().lower()
+
+    subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
+    to_email    = cfg.get("email", "to_email", fallback=None)
+
+    # Auth con pausa su invalid_grant
     try:
         yt = get_authenticated_service(cfg)
+    except RefreshError as e:
+        msg = f"Autenticazione YouTube fallita: {e}"
+        logging.error(msg)
+        write_pause_file(msg)
+        try:
+            send_email(cfg, f"{subj_prefix} Pausa per errore autenticazione",
+                       f"{msg}\n\nTubeSync è stato messo in PAUSA.\n"
+                       f"Rigenera token.json e poi rimuovi: {PAUSE_FILE}")
+        except Exception:
+            pass
+        return
     except Exception as e:
-        err = f"Autenticazione YouTube fallita: {e}"
-        logging.error(err)
-        subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
-        send_email(cfg, f"{subj_prefix} Auth error", err + "\n\n" + traceback.format_exc())
-        sys.exit(2)
+        msg = f"Autenticazione YouTube fallita: {e}"
+        logging.error(msg)
+        write_pause_file(msg)
+        try:
+            send_email(cfg, f"{subj_prefix} Pausa per errore autenticazione",
+                       f"{msg}\n\nTubeSync è stato messo in PAUSA.\n"
+                       f"Rigenera token.json e poi rimuovi: {PAUSE_FILE}")
+        except Exception:
+            pass
+        return
 
-    # Re-validate: se un video 'done' non esiste più su YouTube → pending
-    try:
-        revalidate_done_entries(cfg, con, yt)
-    except Exception as e:
-        logging.warning(f"Re-validate fallita: {e}")
-
-    # Idratazione (mappa titoli esistenti)
+    # Idratazione (opzionale)
     existing_title_map = {}
-    if cfg.getboolean("general", "hydrate_from_youtube_on_start", fallback=True):
+    if hydrate:
         try:
             logging.info("Idratazione: scarico elenco titoli dal canale (playlist Uploads)...")
             existing_title_map = fetch_existing_titles(yt)
@@ -499,28 +386,7 @@ def main():
         except Exception as e:
             logging.warning(f"Idratazione fallita (procedo comunque): {e}")
 
-    # sorgenti & filtri
-    if not cfg.has_option("general", "source_dirs"):
-        logging.error("Nessuna sorgente in [general] source_dirs")
-        sys.exit(2)
-    source_dirs = [s.strip() for s in cfg.get("general", "source_dirs").split(",") if s.strip()]
-    allowed_exts = [e.strip().lower() for e in cfg.get("general", "allowed_extensions", fallback=".mp4,.mov,.m4v,.avi,.mkv").split(",")]
-    min_size_mb = cfg.getint("general", "skip_if_smaller_than_mb", fallback=5)
-    min_size_bytes = max(0, min_size_mb) * 1024 * 1024
-
-    # upload options
-    privacy       = cfg.get("general", "privacy", fallback="private")
-    category_id   = cfg.getint("general", "category_id", fallback=22)
-    description   = cfg.get("general", "description", fallback="")
-    made_for_kids = cfg.getboolean("general", "made_for_kids", fallback=False)
-    use_sha1      = cfg.getboolean("general", "use_sha1", fallback=False)
-    chunk_mb      = cfg.getint("general", "chunk_mb", fallback=8)
-    max_retries   = cfg.getint("general", "max_retries", fallback=8)
-
-    # mail
-    subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
-    to_email    = cfg.get("email", "to_email", fallback=None)
-
+    # Scansione & upload
     count_total = count_done = count_skipped = count_errors = count_marked_done = 0
 
     for p in discover_files(source_dirs, allowed_exts, min_size_bytes):
@@ -532,29 +398,24 @@ def main():
             title = p.stem
             title_key = title.strip().lower()
 
-            # Stato DB
             row = db_get(con, p)
             if row:
                 _id, status, old_size, old_mtime, old_sha1, video_id = row
                 unchanged = (old_size == size and int(old_mtime) == int(mtime) and (not use_sha1 or old_sha1 == sha1))
                 if status == "done" and unchanged:
-                    # (Re-validate è stata fatta già all’avvio; se il video non esisteva
-                    # sarebbe stato messo pending. Qui possiamo skippare tranquilli.)
                     count_skipped += 1
                     continue
 
-            # già su YT (per titolo)?
-            if cfg.getboolean("general", "hydrate_from_youtube_on_start", fallback=True):
-                if title_key in existing_title_map:
-                    vid_found = existing_title_map[title_key]
-                    db_upsert(con, p, size, mtime, sha1, "done", vid_found, None)
+            if hydrate and hydrate_match == "exact_title":
+                found_vid = existing_title_map.get(title_key)
+                if found_vid:
+                    db_upsert(con, p, size, mtime, sha1, "done", found_vid, None)
                     count_marked_done += 1
-                    logging.info(f"[{p.name}] Già presente su YouTube (ID: {vid_found}) → marcato done.")
+                    logging.info(f"[{p.name}] Già presente su YouTube (ID: {found_vid}) → marcato done.")
                     continue
 
-            # upload
             db_upsert(con, p, size, mtime, sha1, "pending", None, None)
-            video_id = resumable_upload(yt, p, title, description, privacy, category_id, chunk_mb, max_retries, made_for_kids)
+            video_id = resumable_upload(yt, p, title, description, privacy, category_id, chunk_mb, max_retries)
             db_upsert(con, p, size, mtime, sha1, "done", video_id, None)
             count_done += 1
 
@@ -563,20 +424,6 @@ def main():
             body = f"Caricamento completato.\n\nFile: {p}\nTitolo: {title}\nVideo ID: {video_id}\nLink: {link}\n"
             send_email(cfg, subject, body)
             logging.info(f"[{p.name}] COMPLETATO: {link}")
-
-        except QuotaExceeded as e:
-            count_errors += 1
-            reason = str(e) or "quotaExceeded"
-            cooldown_min = cfg.getint("general", "quota_cooldown_minutes", fallback=120)
-            until = set_pause(cfg, cooldown_min)
-            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-            logging.error(f"Limite raggiunto ({reason}): pausa di {cooldown_min}m (fino a {when}). Stop immediato.")
-            subject = f"{subj_prefix} Quota exceeded — pausa fino a {when}"
-            body = (f"Limite raggiunto ({reason}).\n"
-                    f"Lo script va in PAUSA per {cooldown_min} minuti (fino a {when}).\n"
-                    f"Nessun altro file verrà processato in questo run.")
-            send_email(cfg, subject, body)
-            return  # stop, niente spam
 
         except Exception as e:
             count_errors += 1
@@ -603,10 +450,9 @@ def main():
                f"Skippati invariati: {count_skipped}, "
                f"Errori: {count_errors}")
     logging.info(summary)
-
-    # Evita mail “vuota” se non è successo nulla
-    if to_email and (count_done > 0 or count_errors > 0):
-        send_email(cfg, f"{subj_prefix} Summary", summary)
+    if to_email and cfg.getboolean("email", "send_summary", fallback=True):
+        if cfg.getboolean("email", "send_summary_when_noop", fallback=False) or any([count_done, count_marked_done, count_errors]):
+            send_email(cfg, f"{subj_prefix} Summary", summary)
 
 if __name__ == "__main__":
     main()
