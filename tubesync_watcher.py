@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-TubeSync Watcher (Log Center)
+TubeSync Watcher — logging su file locale
 - Monitora SOLO le cartelle in `source_dirs` (ricorsivo)
 - Filtra eventi SOLO per le estensioni in `allowed_extensions`
-- Parametri avanzati: debounce, settle, max_debounce, rescan periodico, pausa
+- Parametri avanzati: debounce, settle, max_debounce, rescan, pausa
 - Lancia lo script principale:
     /volume2/TubeSync/.venv/bin/python /volume2/TubeSync/tubesync_synology.py /volume2/TubeSync/config.ini
 """
 
-import sys, time, threading, subprocess, logging, logging.handlers, os, socket
+import sys, time, threading, subprocess, logging, logging.handlers, os
 from pathlib import Path
 from configparser import ConfigParser
 from watchdog.observers import Observer
@@ -18,34 +18,27 @@ from watchdog.events import PatternMatchingEventHandler
 
 DEFAULT_DEBOUNCE_SECONDS = 90
 PAUSE_FILE = Path("/volume2/TubeSync/.auth_paused")
+WATCH_LOG = Path("/volume2/TubeSync/tubesync_watch.log")
 
-# --- Logging su Log Center (+ fallback) ---
+# --- Logging: FILE locale con rotazione ---
 for h in logging.root.handlers[:]:
     logging.root.removeHandler(h)
 
-handlers = []
-syslog_socket = "/dev/log" if os.path.exists("/dev/log") else ("/run/log" if os.path.exists("/run/log") else None)
-if syslog_socket:
-    try:
-        h = logging.handlers.SysLogHandler(address=syslog_socket, facility=logging.handlers.SysLogHandler.LOG_USER)
-        handlers.append(h)
-    except Exception:
-        pass
-if not handlers:
-    try:
-        h = logging.handlers.SysLogHandler(address=("127.0.0.1", 514),
-                                           facility=logging.handlers.SysLogHandler.LOG_USER,
-                                           socktype=socket.SOCK_DGRAM)
-        handlers.append(h)
-    except Exception:
-        pass
-if not handlers:
-    handlers = [logging.StreamHandler()]
+WATCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-fmt = logging.Formatter("TubeSyncWatcher[%(process)d]: [%(levelname)s] %(message)s")
-for h in handlers:
-    h.setFormatter(fmt)
-logging.basicConfig(level=logging.INFO, handlers=handlers)
+fh = logging.handlers.RotatingFileHandler(
+    filename=str(WATCH_LOG),
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+)
+fh.setFormatter(fmt)
+
+console = logging.StreamHandler()
+console.setFormatter(fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[fh, console])
 logger = logging.getLogger("TubeSyncWatcher")
 
 class DebouncedRunner:
@@ -64,11 +57,9 @@ class DebouncedRunner:
         self._first_event_ts = None
         self._last_event_ts = None
 
-        # thread per rescan periodico
         self._rescan_thread = threading.Thread(target=self._rescan_loop, daemon=True)
         self._rescan_thread.start()
 
-        # thread per log attività
         self._activity_thread = threading.Thread(target=self._activity_loop, daemon=True)
         self._activity_thread.start()
 
@@ -96,7 +87,6 @@ class DebouncedRunner:
                 self._first_event_ts = None
                 self._last_event_ts = None
             else:
-                # riprogramma finché non “si calma” o supera max_debounce
                 self._timer = threading.Timer(self.debounce, self._maybe_run)
                 self._timer.daemon = True
                 self._timer.start()
@@ -114,10 +104,9 @@ class DebouncedRunner:
             logger.exception(f"Errore nell'esecuzione del comando: {e}")
 
     def _rescan_loop(self):
-        # trigger massivo periodico
         while True:
             mins = max(1, int(self.rescan_minutes or 60))
-            for _ in range(mins * 6):  # controlla anche la pausa senza aspettare minuti interi
+            for _ in range(mins * 6):
                 if PAUSE_FILE.exists():
                     time.sleep(self.pause_check_seconds)
                 else:
@@ -150,7 +139,7 @@ def read_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
         sys.exit(1)
-    cfg = ConfigParser(inline_comment_prefixes=(';', '#'))
+    cfg = ConfigParser(inline_comment_prefixes=(";", "#"))
     cfg.read(cfg_path)
     return cfg
 
@@ -173,13 +162,11 @@ def main():
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("/volume2/TubeSync/config.ini")
     cfg = read_config(cfg_path)
 
-    # source_dirs
     if not cfg.has_option("general", "source_dirs"):
         logger.error("source_dirs mancante in [general] del config.ini")
         sys.exit(2)
     roots = [s.strip() for s in cfg.get("general", "source_dirs").split(",") if s.strip()]
 
-    # allowed_extensions -> patterns
     if not cfg.has_option("general", "allowed_extensions"):
         logger.error("allowed_extensions mancante in [general] del config.ini")
         sys.exit(2)
@@ -187,7 +174,6 @@ def main():
     patterns = build_patterns_from_extensions(exts)
     logger.info(f"Estensioni monitorate: {patterns}")
 
-    # watcher params
     debounce_seconds = cfg.getint("watcher", "debounce_seconds", fallback=DEFAULT_DEBOUNCE_SECONDS)
     settle_seconds = cfg.getint("watcher", "settle_seconds", fallback=60)
     max_debounce_seconds = cfg.getint("watcher", "max_debounce_seconds", fallback=900)
@@ -195,7 +181,6 @@ def main():
     pause_check_seconds = cfg.getint("watcher", "pause_check_seconds", fallback=30)
     event_log_interval_seconds = cfg.getint("watcher", "event_log_interval_seconds", fallback=180)
 
-    # comando uploader
     cmd = ["/volume2/TubeSync/.venv/bin/python", "/volume2/TubeSync/tubesync_synology.py", str(cfg_path)]
     runner = DebouncedRunner(
         cmd,
@@ -207,14 +192,12 @@ def main():
         event_log_interval_seconds=event_log_interval_seconds,
     )
 
-    # prima scansione subito
     if PAUSE_FILE.exists():
         logger.info(f"Pausa attiva ({PAUSE_FILE}). Skip scansione iniziale.")
     else:
         logger.info("Avvio watcher: eseguo subito una scansione iniziale.")
         runner._run()
 
-    # osservatori
     observer = Observer()
     any_root = False
     for root in roots:
