@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, time, json, hashlib, logging, logging.handlers, sqlite3, smtplib, traceback, os
+import sys, time, json, hashlib, logging, sqlite3, smtplib, traceback, os, subprocess
 from pathlib import Path
 from configparser import ConfigParser
 from email.mime.text import MIMEText
@@ -15,45 +15,54 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
 
-# --------- Costanti ---------
+# ---------- Costanti ----------
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
 PAUSE_FILE = Path("/volume2/TubeSync/.auth_paused")
 
-# --------- Config ---------
+# ---------- Log Center (System log) ----------
+class SynologySystemLogHandler(logging.Handler):
+    LEVEL_MAP = {
+        logging.DEBUG: "info",
+        logging.INFO: "info",
+        logging.WARNING: "warn",
+        logging.ERROR: "err",
+        logging.CRITICAL: "crit",
+    }
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            level = self.LEVEL_MAP.get(record.levelno, "info")
+            # Log nel registro "System" di DSM
+            subprocess.run(
+                ["/usr/syno/bin/synologset1", "sys", level, f"TubeSync: {msg}"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+def setup_logging():
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    fmt = logging.Formatter("%(message)s")  # il timestamp lo aggiunge DSM
+    syno = SynologySystemLogHandler()
+    syno.setFormatter(fmt)
+    console = logging.StreamHandler()  # utile se lanci in foreground
+    console.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[syno, console])
+
+# ---------- Config / DB ----------
 def load_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
-        print(f"Config non trovato: {cfg_path}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Config non trovato: {cfg_path}", file=sys.stderr); sys.exit(1)
     cfg = ConfigParser(inline_comment_prefixes=(";", "#"))
     cfg.read(cfg_path)
     return cfg
 
-# --------- Logging: FILE locale con rotazione ---------
-def setup_logging(log_path: Path):
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=str(log_path),
-        maxBytes=10 * 1024 * 1024,  # 10MB
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-
-    console = logging.StreamHandler()  # utile quando lanci in foreground
-    console.setFormatter(fmt)
-
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console])
-
-# --------- DB ---------
 def ensure_db(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
@@ -64,7 +73,7 @@ def ensure_db(db_path: Path):
         size INTEGER,
         mtime REAL,
         sha1 TEXT,
-        status TEXT,
+        status TEXT,      -- pending|done|error
         video_id TEXT,
         error TEXT,
         created_at REAL,
@@ -75,7 +84,7 @@ def ensure_db(db_path: Path):
     con.commit()
     return con
 
-# --------- Utils ---------
+# ---------- Utils ----------
 def write_pause_file(reason: str):
     try:
         with open(PAUSE_FILE, "w") as f:
@@ -119,109 +128,81 @@ def db_upsert(con, path: Path, size, mtime, sha1, status, video_id=None, error=N
     now = time.time()
     try:
         con.execute("""
-            INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                size=excluded.size,
-                mtime=excluded.mtime,
-                sha1=excluded.sha1,
-                status=excluded.status,
-                video_id=excluded.video_id,
-                error=excluded.error,
-                updated_at=excluded.updated_at
+        INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            size=excluded.size, mtime=excluded.mtime, sha1=excluded.sha1,
+            status=excluded.status, video_id=excluded.video_id, error=excluded.error,
+            updated_at=excluded.updated_at
         """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
         con.commit()
     except sqlite3.OperationalError:
         cur = con.execute("SELECT 1 FROM uploads WHERE path = ?", (str(path),))
         if cur.fetchone():
-            con.execute("""
-                UPDATE uploads SET size=?, mtime=?, sha1=?, status=?, video_id=?, error=?, updated_at=?
-                WHERE path=?
-            """, (size, mtime, sha1, status, video_id, error, now, str(path)))
+            con.execute("""UPDATE uploads SET size=?, mtime=?, sha1=?, status=?, video_id=?, error=?, updated_at=? WHERE path=?""",
+                        (size, mtime, sha1, status, video_id, error, now, str(path)))
         else:
-            con.execute("""
-                INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
+            con.execute("""INSERT INTO uploads (path, size, mtime, sha1, status, video_id, error, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (str(path), size, mtime, sha1, status, video_id, error, now, now))
         con.commit()
 
-# --------- Email (SMTP2GO API / SMTP) ---------
+# ---------- Email ----------
 def send_email(cfg: ConfigParser, subject: str, body: str):
     if not cfg.getboolean("email", "enabled", fallback=False):
         return
-
-    method = cfg.get("email", "method", fallback=None)
-    mode = cfg.get("email", "mode", fallback=None)
-    mode = (method or mode or "smtp").strip().lower()
-
-    from_email = cfg.get("email", "from_email")
-    to_email   = cfg.get("email", "to_email")
-
-    if mode == "smtp2go_api":
+    method = (cfg.get("email", "method", fallback=cfg.get("email", "mode", fallback="smtp"))).strip().lower()
+    from_email = cfg.get("email", "from_email"); to_email = cfg.get("email", "to_email")
+    if method == "smtp2go_api":
         import json as _json, urllib.request as _ur
         api_key = cfg.get("email", "smtp2go_api_key", fallback=None)
         api_url = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
         if not api_key:
-            logging.error("SMTP2GO_API: api_key mancante in config.ini [email]")
-            return
-        payload = {
-            "api_key": api_key,
-            "to":      [to_email],
-            "sender":  from_email,
-            "subject": subject,
-            "text_body": body
-        }
+            logging.error("SMTP2GO_API: api_key mancante"); return
+        payload = {"api_key": api_key, "to": [to_email], "sender": from_email, "subject": subject, "text_body": body}
         data = _json.dumps(payload).encode("utf-8")
         req = _ur.Request(api_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
         try:
             with _ur.urlopen(req, timeout=20) as resp:
                 logging.info(f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
         except Exception as e:
-            logging.error(f"SMTP2GO_API: errore invio email: {e}")
+            logging.error(f"SMTP2GO_API: errore invio: {e}")
         return
-
-    # Fallback SMTP classico
+    # SMTP fallback
     host = cfg.get("email", "smtp_host", fallback="127.0.0.1")
     port = cfg.getint("email", "smtp_port", fallback=587)
     use_tls = cfg.getboolean("email", "use_tls", fallback=True)
     use_ssl = cfg.getboolean("email", "use_ssl", fallback=False)
     user = cfg.get("email", "username", fallback=None)
     pwd  = cfg.get("email", "password", fallback=None)
-
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg["Date"] = formatdate(localtime=True)
-
+    msg["Subject"] = subject; msg["From"] = from_email; msg["To"] = to_email; msg["Date"] = formatdate(localtime=True)
     try:
         if use_ssl:
+            import smtplib
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
                 if user and pwd: s.login(user, pwd)
                 s.sendmail(from_email, [to_email], msg.as_string())
         else:
+            import smtplib
             with smtplib.SMTP(host, port, timeout=30) as s:
                 if use_tls: s.starttls()
                 if user and pwd: s.login(user, pwd)
                 s.sendmail(from_email, [to_email], msg.as_string())
-        logging.info("SMTP: mail inviata con successo.")
+        logging.info("SMTP: mail inviata.")
     except Exception as e:
-        logging.error(f"SMTP: errore invio email: {e}")
+        logging.error(f"SMTP: errore invio: {e}")
 
-# --------- YouTube auth & helpers ---------
+# ---------- YouTube ----------
 def get_authenticated_service(cfg: ConfigParser):
     client_secret = Path(cfg.get("general", "client_secret_path")).expanduser()
     token_path = Path(cfg.get("general", "token_path")).expanduser()
-
     if not client_secret.exists():
         raise FileNotFoundError(f"client_secret.json non trovato: {client_secret}")
-
     creds = None
     if token_path.exists():
         with open(token_path, "r") as f:
-            data = json.load(f)
-        creds = Credentials.from_authorized_user_info(data, SCOPES)
-
+            creds = Credentials.from_authorized_user_info(json.load(f), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -230,94 +211,63 @@ def get_authenticated_service(cfg: ConfigParser):
                 raise
         else:
             raise RefreshError("no_valid_token", "Missing/expired token and no interactive login available")
-
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def fetch_existing_titles(youtube):
     titles = {}
     ch = youtube.channels().list(part="contentDetails", mine=True).execute()
     items = ch.get("items", [])
-    if not items:
-        return titles
-    uploads_playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-
-    page_token = None
+    if not items: return titles
+    uploads = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    page = None
     while True:
-        resp = youtube.playlistItems().list(
-            part="snippet,status",
-            playlistId=uploads_playlist_id,
-            maxResults=50,
-            pageToken=page_token
-        ).execute()
+        resp = youtube.playlistItems().list(part="snippet,status", playlistId=uploads, maxResults=50, pageToken=page).execute()
         for it in resp.get("items", []):
             sn = it.get("snippet", {})
             title = (sn.get("title") or "").strip().lower()
             vid = (sn.get("resourceId", {}) or {}).get("videoId")
-            if title and vid:
-                titles[title] = vid
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+            if title and vid: titles[title] = vid
+        page = resp.get("nextPageToken")
+        if not page: break
     return titles
 
-# --------- Upload ---------
 def resumable_upload(youtube, file_path: Path, title: str, description: str, privacy: str, category_id: int, chunk_mb: int, max_retries: int):
-    body = {
-        "snippet": {
-            "title": title,
-            "description": description or "",
-            "categoryId": str(category_id) if category_id else None
-        },
-        "status": {"privacyStatus": privacy or "private"}
-    }
+    body = {"snippet": {"title": title, "description": description or "", "categoryId": str(category_id) if category_id else None},
+            "status": {"privacyStatus": privacy or "private"}}
     body["snippet"] = {k: v for k, v in body["snippet"].items() if v is not None}
-
     media = MediaFileUpload(str(file_path), chunksize=chunk_mb * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-
-    response = None
-    retry = 0
-    backoff = 2
-
+    response = None; retry = 0; backoff = 2
     while response is None:
         try:
             status, response = request.next_chunk()
             if status:
-                pct = int(status.progress() * 100)
-                logging.info(f"[{file_path.name}] Progresso upload: {pct}%")
+                logging.info(f"[{file_path.name}] Progresso upload: {int(status.progress()*100)}%")
             if response is not None:
-                if "id" in response:
-                    return response["id"]
-                else:
-                    raise RuntimeError(f"Risposta inattesa API: {response}")
+                if "id" in response: return response["id"]
+                raise RuntimeError(f"Risposta inattesa API: {response}")
         except HttpError as e:
-            if e.resp.status in [500, 502, 503, 504] and retry < max_retries:
-                retry += 1
-                sleep_s = backoff ** retry
-                logging.warning(f"[{file_path.name}] Errore temporaneo {e.resp.status}, retry {retry}/{max_retries} tra {sleep_s}s")
-                time.sleep(sleep_s)
-                continue
+            if e.resp.status in [500,502,503,504] and retry < max_retries:
+                retry += 1; sleep_s = backoff ** retry
+                logging.warning(f"[{file_path.name}] Errore {e.resp.status}, retry {retry}/{max_retries} tra {sleep_s}s")
+                time.sleep(sleep_s); continue
             raise
         except Exception as e:
             if retry < max_retries:
-                retry += 1
-                sleep_s = backoff ** retry
+                retry += 1; sleep_s = backoff ** retry
                 logging.warning(f"[{file_path.name}] Eccezione {type(e).__name__}: {e} — retry {retry}/{max_retries} tra {sleep_s}s")
-                time.sleep(sleep_s)
-                continue
+                time.sleep(sleep_s); continue
             raise
 
-# --------- Main ---------
+# ---------- Main ----------
 def main():
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("/volume2/TubeSync/config.ini")
     cfg = load_config(cfg_path)
 
+    setup_logging()
     if PAUSE_FILE.exists():
-        print(f"TubeSync in pausa: rimuovi {PAUSE_FILE} dopo aver risolto l'autenticazione.")
+        logging.info(f"Pausa attiva ({PAUSE_FILE}). Stop.")
         return
-
-    log_path = Path(cfg.get("general", "log_path", fallback="/volume2/TubeSync/tubesync.log")).expanduser()
-    setup_logging(log_path)
 
     con = ensure_db(Path(cfg.get("general", "db_path", fallback="/volume2/TubeSync/state.db")).expanduser())
 
@@ -339,59 +289,52 @@ def main():
     subj_prefix = cfg.get("email", "subject_prefix", fallback="[TubeSync] ")
     to_email    = cfg.get("email", "to_email", fallback=None)
 
-    # Auth con pausa su invalid_grant
+    # Auth con pausa
     try:
         yt = get_authenticated_service(cfg)
     except RefreshError as e:
         msg = f"Autenticazione YouTube fallita: {e}"
-        logging.error(msg)
-        write_pause_file(msg)
+        logging.error(msg); write_pause_file(msg)
         try:
             send_email(cfg, f"{subj_prefix} Pausa per errore autenticazione",
-                       f"{msg}\n\nTubeSync è stato messo in PAUSA.\n"
-                       f"Rigenera token.json e poi rimuovi: {PAUSE_FILE}")
-        except Exception:
-            pass
+                       f"{msg}\n\nTubeSync in PAUSA.\nRigenera token.json e poi rimuovi: {PAUSE_FILE}")
+        except Exception: pass
         return
     except Exception as e:
         msg = f"Autenticazione YouTube fallita: {e}"
-        logging.error(msg)
-        write_pause_file(msg)
+        logging.error(msg); write_pause_file(msg)
         try:
             send_email(cfg, f"{subj_prefix} Pausa per errore autenticazione",
-                       f"{msg}\n\nTubeSync è stato messo in PAUSA.\n"
-                       f"Rigenera token.json e poi rimuovi: {PAUSE_FILE}")
-        except Exception:
-            pass
+                       f"{msg}\n\nTubeSync in PAUSA.\nRigenera token.json e poi rimuovi: {PAUSE_FILE}")
+        except Exception: pass
         return
 
+    # Idratazione
     existing_title_map = {}
     if hydrate:
         try:
-            logging.info("Idratazione: scarico elenco titoli dal canale (playlist Uploads)...")
+            logging.info("Idratazione: scarico elenco titoli dal canale (Uploads)...")
             existing_title_map = fetch_existing_titles(yt)
-            logging.info(f"Idratazione completata: trovati {len(existing_title_map)} video esistenti.")
+            logging.info(f"Idratazione completata: {len(existing_title_map)} video trovati.")
         except Exception as e:
-            logging.warning(f"Idratazione fallita (procedo comunque): {e}")
+            logging.warning(f"Idratazione fallita (procedo): {e}")
 
+    # Scansione & upload
     count_total = count_done = count_skipped = count_errors = count_marked_done = 0
 
     for p in discover_files(source_dirs, allowed_exts, min_size_bytes):
         count_total += 1
         try:
-            st = p.stat()
-            size, mtime = st.st_size, st.st_mtime
+            st = p.stat(); size, mtime = st.st_size, st.st_mtime
             sha1 = sha1_of_file(p) if use_sha1 else None
-            title = p.stem
-            title_key = title.strip().lower()
+            title = p.stem; title_key = title.strip().lower()
 
             row = db_get(con, p)
             if row:
                 _id, status, old_size, old_mtime, old_sha1, video_id = row
                 unchanged = (old_size == size and int(old_mtime) == int(mtime) and (not use_sha1 or old_sha1 == sha1))
                 if status == "done" and unchanged:
-                    count_skipped += 1
-                    continue
+                    count_skipped += 1; continue
 
             if hydrate and hydrate_match == "exact_title":
                 found_vid = existing_title_map.get(title_key)
@@ -407,18 +350,16 @@ def main():
             count_done += 1
 
             link = f"https://youtu.be/{video_id}"
-            subject = f"{subj_prefix} OK — {p.name}"
-            body = f"Caricamento completato.\n\nFile: {p}\nTitolo: {title}\nVideo ID: {video_id}\nLink: {link}\n"
-            send_email(cfg, subject, body)
             logging.info(f"[{p.name}] COMPLETATO: {link}")
+            send_email(cfg, f"{subj_prefix} OK — {p.name}",
+                       f"Caricamento completato.\n\nFile: {p}\nTitolo: {title}\nVideo ID: {video_id}\nLink: {link}\n")
 
         except Exception as e:
             count_errors += 1
             logging.error(f"[{p.name}] ERRORE: {e}")
             logging.error(traceback.format_exc())
             try:
-                st = p.stat()
-                size, mtime = st.st_size, st.st_mtime
+                st = p.stat(); size, mtime = st.st_size, st.st_mtime
             except Exception:
                 size = mtime = None
             sha1 = None
@@ -426,10 +367,8 @@ def main():
                 try: sha1 = sha1_of_file(p)
                 except Exception: pass
             db_upsert(con, p, size, mtime, sha1, "error", None, str(e))
-
-            subject = f"{subj_prefix} ERROR — {p.name}"
-            body = f"Caricamento FALLITO.\n\nFile: {p}\n\nErrore: {e}\n\nTraceback:\n{traceback.format_exc()}"
-            send_email(cfg, subject, body)
+            send_email(cfg, f"{subj_prefix} ERROR — {p.name}",
+                       f"Caricamento FALLITO.\n\nFile: {p}\n\nErrore: {e}\n\nTraceback:\n{traceback.format_exc()}")
 
     summary = (f"Totale trovati: {count_total}, "
                f"Caricati ora: {count_done}, "
