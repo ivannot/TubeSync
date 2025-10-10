@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, time, json, hashlib, logging, logging.handlers, sqlite3, smtplib, traceback, os, socket
+import sys, time, json, hashlib, logging, logging.handlers, sqlite3, smtplib, traceback, os
 from pathlib import Path
 from configparser import ConfigParser
 from email.mime.text import MIMEText
@@ -22,44 +22,38 @@ SCOPES = [
 ]
 PAUSE_FILE = Path("/volume2/TubeSync/.auth_paused")
 
-# --------- Config & logging ---------
+# --------- Config ---------
 def load_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
         sys.exit(1)
-    cfg = ConfigParser(inline_comment_prefixes=(';', '#'))
+    cfg = ConfigParser(inline_comment_prefixes=(";", "#"))
     cfg.read(cfg_path)
     return cfg
 
-def setup_logging(_: Path):
-    # Syslog → Log Center, con fallback UDP 127.0.0.1:514 e infine stdout
+# --------- Logging: FILE locale con rotazione ---------
+def setup_logging(log_path: Path):
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
 
-    handlers = []
-    syslog_socket = "/dev/log" if os.path.exists("/dev/log") else ("/run/log" if os.path.exists("/run/log") else None)
-    if syslog_socket:
-        try:
-            h = logging.handlers.SysLogHandler(address=syslog_socket, facility=logging.handlers.SysLogHandler.LOG_USER)
-            handlers.append(h)
-        except Exception:
-            pass
-    if not handlers:
-        try:
-            h = logging.handlers.SysLogHandler(address=("127.0.0.1", 514),
-                                               facility=logging.handlers.SysLogHandler.LOG_USER,
-                                               socktype=socket.SOCK_DGRAM)
-            handlers.append(h)
-        except Exception:
-            pass
-    if not handlers:
-        handlers = [logging.StreamHandler()]
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fmt = logging.Formatter("TubeSyncUploader[%(process)d]: [%(levelname)s] %(message)s")
-    for h in handlers:
-        h.setFormatter(fmt)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=str(log_path),
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+
+    console = logging.StreamHandler()  # utile quando lanci in foreground
+    console.setFormatter(fmt)
+
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console])
+
+# --------- DB ---------
 def ensure_db(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
@@ -70,7 +64,7 @@ def ensure_db(db_path: Path):
         size INTEGER,
         mtime REAL,
         sha1 TEXT,
-        status TEXT,          -- pending|done|error
+        status TEXT,
         video_id TEXT,
         error TEXT,
         created_at REAL,
@@ -228,22 +222,18 @@ def get_authenticated_service(cfg: ConfigParser):
             data = json.load(f)
         creds = Credentials.from_authorized_user_info(data, SCOPES)
 
-    # Tentativo refresh o richiesta re-auth (headless → fallo gestire esternamente)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
             except RefreshError as e:
-                # Propaga: verrà gestito in main() con pausa
                 raise
         else:
-            # NAS headless: niente browser. Fallire e gestire in main().
             raise RefreshError("no_valid_token", "Missing/expired token and no interactive login available")
 
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def fetch_existing_titles(youtube):
-    """Ritorna dict { titolo_lower: video_id } per tutti i video della playlist 'Uploads'."""
     titles = {}
     ch = youtube.channels().list(part="contentDetails", mine=True).execute()
     items = ch.get("items", [])
@@ -322,7 +312,6 @@ def main():
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("/volume2/TubeSync/config.ini")
     cfg = load_config(cfg_path)
 
-    # Rispetta pausa (manuale o impostata da auth failure)
     if PAUSE_FILE.exists():
         print(f"TubeSync in pausa: rimuovi {PAUSE_FILE} dopo aver risolto l'autenticazione.")
         return
@@ -376,7 +365,6 @@ def main():
             pass
         return
 
-    # Idratazione (opzionale)
     existing_title_map = {}
     if hydrate:
         try:
@@ -386,7 +374,6 @@ def main():
         except Exception as e:
             logging.warning(f"Idratazione fallita (procedo comunque): {e}")
 
-    # Scansione & upload
     count_total = count_done = count_skipped = count_errors = count_marked_done = 0
 
     for p in discover_files(source_dirs, allowed_exts, min_size_bytes):
