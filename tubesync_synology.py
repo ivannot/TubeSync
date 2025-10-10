@@ -342,10 +342,34 @@ def main():
         err = f"Autenticazione YouTube fallita: {e}"
         logging.error(err)
         syno_log_err("AUTH_FAIL", err)
+        
+        # Invia email con istruzioni dettagliate
+        email_body = f"""ERRORE CRITICO: Autenticazione YouTube fallita
+
+Il TubeSync Watcher ha SOSPESO tutte le esecuzioni automatiche per evitare spam di email.
+
+Errore:
+{err}
+
+Dettagli tecnici:
+{traceback.format_exc()}
+
+AZIONI NECESSARIE:
+1. Verifica che il token YouTube sia valido
+2. Se il token è scaduto, rigeneralo seguendo la procedura di setup
+3. Dopo aver corretto il problema, riavvia il servizio con:
+   ./tubesync.sh restart
+
+Il watcher NON riproverà automaticamente fino al riavvio manuale del servizio.
+
+Timestamp: {time.strftime('%F %T')}
+"""
+        
         try:
-            send_email(cfg, f"{subj_prefix} Auth error", err + "\n\n" + traceback.format_exc())
-        except Exception:
-            pass
+            send_email(cfg, f"{subj_prefix} ERRORE CRITICO - Autenticazione fallita", email_body)
+        except Exception as email_err:
+            logging.error(f"Impossibile inviare email di notifica: {email_err}")
+        
         sys.exit(2)
 
     existing_title_map = {}
