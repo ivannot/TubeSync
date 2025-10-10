@@ -1,86 +1,64 @@
 #!/bin/sh
-# TubeSync controller (start|stop|restart|status)
-# Tutti i path sono relativi alla directory dello script.
+### TubeSync Watcher service script for Synology DSM
+### Usage: ./tubesync.sh [start|stop|restart|status]
 
-set -eu
+VENV="/volume2/TubeSync/.venv/bin/activate"
+PYTHON="/volume2/TubeSync/.venv/bin/python3"
+WATCHER="/volume2/TubeSync/tubesync_watcher.py"
+CONFIG="/volume2/TubeSync/config.ini"
+PIDFILE="/volume2/TubeSync/tubesync_watcher.pid"
 
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="$BASE_DIR/config.ini"
-VENV="$BASE_DIR/.venv"
-WATCHER="$BASE_DIR/tubesync_watcher.py"
-
-synolog() {
-  # synolog <level> "message"  (level: info|warn|err)
-  level="$1"; shift
-  msg="$*"
-
-  case "$level" in
-    info|warn|err) ;;
-    warning) level="warn" ;;
-    error)   level="err"  ;;
-    *)       level="info" ;;
-  esac
-
-  # Normalizza EVENT HEX in formato *con* 0x + 8 cifre uppercase
-  raw="${TS_EVENT_HEX:-0x11100000}"
-  # rimuovi eventuale 0x, uppercase, pad/tronca a 8, poi ri-prepende 0x
-  hex="$(echo "$raw" | sed 's/^0[xX]//' | tr '[:lower:]' '[:upper:]')"
-  hex="$(printf '%-8s' "$hex" | tr ' ' '0' | cut -c1-8)"
-  event_id="0x$hex"
-
-  if [ -x /usr/syno/bin/synologset1 ]; then
-    /usr/syno/bin/synologset1 sys "$level" "$event_id" "TubeSync: $msg"
-  else
-    logger -t "TubeSync" -p "user.$level" "$msg"
-  fi
-}
-
-_require_files() {
-  [ -f "$CONFIG" ]  || { echo "❌ Missing $CONFIG"; synolog err "Missing config.ini"; exit 1; }
-  [ -f "$WATCHER" ] || { echo "❌ Missing $WATCHER"; synolog err "Missing tubesync_watcher.py"; exit 1; }
-  [ -f "$VENV/bin/activate" ] || { echo "❌ Missing venv at $VENV"; synolog err "Missing venv"; exit 1; }
+# Funzione per loggare su Log Center (metodo testato e funzionante)
+syno_log() {
+    LEVEL="$1"
+    MSG="$2"
+    synologset1 sys "$LEVEL" 0x11100000 "[TubeSync:SCRIPT] $MSG - $(date '+%F %T')"
 }
 
 start() {
-  _require_files
-  # shellcheck disable=SC1090
-  . "$VENV/bin/activate"
-  nohup python3 "$WATCHER" "$CONFIG" >/dev/null 2>&1 &
-  pid=$!
-  echo "✅ TubeSync Watcher started (pid=$pid)"
-  synolog info "Watcher started (pid=$pid)"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "⚠️  TubeSync Watcher already running (pid=$(cat "$PIDFILE"))"
+        exit 0
+    fi
+
+    echo "✅ Starting TubeSync Watcher..."
+    /bin/sh -c "source \"$VENV\" && nohup \"$PYTHON\" \"$WATCHER\" \"$CONFIG\" >/dev/null 2>&1 & echo \$! > \"$PIDFILE\""
+
+    syno_log "info" "Watcher started (pid=$(cat "$PIDFILE"))"
+    echo "✅ TubeSync Watcher started (pid=$(cat "$PIDFILE"))"
 }
 
 stop() {
-  pids="$(pgrep -f "$WATCHER" || true)"
-  if [ -n "$pids" ]; then
-    echo "$pids" | xargs -r kill >/dev/null 2>&1 || true
-    sleep 1
-    echo "🛑 TubeSync Watcher stopped."
-    synolog info "Watcher stopped"
-  else
-    echo "⚠️  No TubeSync Watcher running."
-    synolog warn "No watcher running"
-  fi
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        PID=$(cat "$PIDFILE")
+        echo "🛑 Stopping TubeSync Watcher (pid=$PID)..."
+        kill "$PID" 2>/dev/null
+        rm -f "$PIDFILE"
+        syno_log "info" "Watcher stopped (pid=$PID)"
+        echo "🛑 TubeSync Watcher stopped."
+    else
+        echo "⚠️  TubeSync Watcher not running."
+    fi
 }
 
 status() {
-  pgrep -af "$WATCHER" || echo "❌ TubeSync Watcher not running"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "✅ TubeSync Watcher is running (pid=$(cat "$PIDFILE"))"
+    else
+        echo "⚠️  TubeSync Watcher is not running."
+    fi
 }
 
 restart() {
-  stop
-  sleep 2
-  start
+    stop
+    sleep 1
+    start
 }
 
-case "${1:-}" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) restart ;;
-  status)  status ;;
-  *)
-    echo "Usage: $0 {start|stop|restart|status}"
-    exit 1
-    ;;
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) restart ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}" ;;
 esac
