@@ -18,59 +18,41 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
 
-# ========= Log Center helper (metodo testato e funzionante) =========
-def syno_log_info(tag: str, msg: str):
-    """Scrive su Log Center usando synologset1 con ID generico 0x11100000"""
-    try:
-        subprocess.run([
-            "synologset1", "sys", "info", "0x11100000",
-            f"[TubeSync:{tag}] {msg} - {time.strftime('%F %T')}"
-        ], check=False, timeout=2)
-    except Exception:
-        pass
+# ======= PAUSA GLOBALE =========
+PAUSE_FLAG = Path("/volume2/TubeSync/.auth_paused")
 
-def syno_log_warn(tag: str, msg: str):
-    try:
-        subprocess.run([
-            "synologset1", "sys", "warn", "0x11100000",
-            f"[TubeSync:{tag}] {msg} - {time.strftime('%F %T')}"
-        ], check=False, timeout=2)
-    except Exception:
-        pass
+# ======= Log Center helper (forma testata) =======
+def syno_log_info(eid_hex: str, msg: str):
+    cmd = f'/usr/syno/bin/synologset1 sys info {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
+    subprocess.run(["/bin/sh", "-c", cmd], check=False)
 
-def syno_log_err(tag: str, msg: str):
-    try:
-        subprocess.run([
-            "synologset1", "sys", "err", "0x11100000",
-            f"[TubeSync:{tag}] {msg} - {time.strftime('%F %T')}"
-        ], check=False, timeout=2)
-    except Exception:
-        pass
+def syno_log_warn(eid_hex: str, msg: str):
+    cmd = f'/usr/syno/bin/synologset1 sys warn {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
+    subprocess.run(["/bin/sh", "-c", cmd], check=False)
 
-# ========= Logging console (anche syslog) =========
+def syno_log_err(eid_hex: str, msg: str):
+    cmd = f'/usr/syno/bin/synologset1 sys err {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
+    subprocess.run(["/bin/sh", "-c", cmd], check=False)
+
+# ======= Logging console =======
 def setup_logging():
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
     fmt = logging.Formatter("%(name)s[%(process)d]: %(message)s")
     handlers = [logging.StreamHandler()]
     handlers[0].setFormatter(fmt)
-    
-    # Prova a configurare SysLogHandler
     try:
         if os.path.exists("/dev/log"):
-            h = logging.handlers.SysLogHandler(
-                address="/dev/log",
-                facility=logging.handlers.SysLogHandler.LOG_USER
-            )
+            h = logging.handlers.SysLogHandler(address="/dev/log",
+                                               facility=logging.handlers.SysLogHandler.LOG_DAEMON)
             h.setFormatter(fmt)
             handlers.append(h)
     except Exception:
         pass
-    
     logging.basicConfig(level=logging.INFO, handlers=handlers)
-    logging.getLogger().name = "TubeSync"
+    logging.getLogger().name = "TubeSyncUploader"
 
-# ========= Config / DB / Utils =========
+# ======= Config / DB / Utils =======
 def load_config(cfg_path: Path) -> ConfigParser:
     if not cfg_path.exists():
         print(f"Config non trovato: {cfg_path}", file=sys.stderr)
@@ -118,7 +100,7 @@ def discover_files(source_dirs, allowed_exts, min_size_bytes):
         root = Path(s).expanduser()
         if not root.exists():
             logging.warning(f"Cartella sorgente non trovata: {root}")
-            syno_log_warn("WARN", f"Cartella sorgente non trovata: {root}")
+            syno_log_warn("0x11100061", f"Cartella sorgente non trovata: {root}")
             continue
         for p in root.rglob("*"):
             if p.is_file() and is_allowed_ext(p, allowed_exts):
@@ -129,7 +111,7 @@ def discover_files(source_dirs, allowed_exts, min_size_bytes):
                     yield p
                 except Exception as e:
                     logging.error(f"Stat fallita per {p}: {e}")
-                    syno_log_err("ERROR", f"Stat fallita per {p}: {e}")
+                    syno_log_err("0x11100062", f"Stat fallita per {p}: {e}")
 
 def db_get(con, path: Path):
     cur = con.execute("SELECT id, status, size, mtime, sha1, video_id FROM uploads WHERE path = ?", (str(path),))
@@ -147,7 +129,7 @@ def db_upsert(con, path: Path, size, mtime, sha1, status, video_id=None, error=N
     """, (str(path), size, mtime, sha1, status, video_id, error, now, now))
     con.commit()
 
-# ========= Email =========
+# ======= Email =======
 def send_email(cfg: ConfigParser, subject: str, body: str):
     if not cfg.getboolean("email", "enabled", fallback=False):
         return
@@ -161,7 +143,7 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
         api_url = cfg.get("email", "smtp2go_api_url", fallback="https://api.smtp2go.com/v3/email/send")
         if not api_key:
             logging.error("SMTP2GO_API: api_key mancante")
-            syno_log_err("ERROR", "SMTP2GO_API: api_key mancante")
+            syno_log_err("0x1110006C", "SMTP2GO_API: api_key mancante")
             return
         payload = {"api_key": api_key, "to": [to_email], "sender": from_email, "subject": subject, "text_body": body}
         data = _json.dumps(payload).encode("utf-8")
@@ -169,10 +151,10 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
         try:
             with _ur.urlopen(req, timeout=20) as resp:
                 logging.info(f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
-                syno_log_info("EMAIL", f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
+                syno_log_info("0x1110006B", f"SMTP2GO_API: mail inviata. HTTP {resp.status}")
         except Exception as e:
             logging.error(f"SMTP2GO_API: errore invio: {e}")
-            syno_log_err("EMAIL_ERR", f"SMTP2GO_API: errore invio: {e}")
+            syno_log_err("0x1110006C", f"SMTP2GO_API: errore invio: {e}")
         return
 
     # SMTP standard
@@ -203,18 +185,18 @@ def send_email(cfg: ConfigParser, subject: str, body: str):
                     s.login(user, pwd)
                 s.sendmail(from_email, [to_email], msg.as_string())
         logging.info("SMTP: mail inviata.")
-        syno_log_info("EMAIL", "SMTP: mail inviata.")
+        syno_log_info("0x1110006D", "SMTP: mail inviata.")
     except Exception as e:
         logging.error(f"SMTP: errore invio: {e}")
-        syno_log_err("EMAIL_ERR", f"SMTP: errore invio: {e}")
+        syno_log_err("0x1110006E", f"SMTP: errore invio: {e}")
 
-# ========= YouTube =========
+# ======= YouTube =======
 def get_authenticated_service(cfg: ConfigParser):
     client_secret = Path(cfg.get("general", "client_secret_path")).expanduser()
     token_path = Path(cfg.get("general", "token_path")).expanduser()
     if not client_secret.exists():
         msg = f"client_secret.json non trovato: {client_secret}"
-        logging.error(msg); syno_log_err("AUTH_ERR", msg)
+        logging.error(msg); syno_log_err("0x11100070", msg)
         raise FileNotFoundError(msg)
 
     creds = None
@@ -227,7 +209,7 @@ def get_authenticated_service(cfg: ConfigParser):
             creds.refresh(Request())
         else:
             msg = "Token non valido/assente; rigenera token.json e riprova."
-            logging.error(msg); syno_log_err("AUTH_ERR", msg)
+            logging.error(msg); syno_log_err("0x11100071", msg)
             raise RuntimeError(msg)
 
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
@@ -286,7 +268,7 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str, pri
                 sleep_s = backoff ** retry
                 msg = f"[{file_path.name}] Errore {e.resp.status}, retry {retry}/{max_retries} tra {sleep_s}s"
                 logging.warning(msg)
-                syno_log_warn("RETRY", msg)
+                syno_log_warn("0x11100080", msg)
                 time.sleep(sleep_s)
                 continue
             raise
@@ -294,9 +276,9 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str, pri
             if retry < max_retries:
                 retry += 1
                 sleep_s = backoff ** retry
-                msg = f"[{file_path.name}] Eccezione {type(e).__name__}: {e} - retry {retry}/{max_retries} tra {sleep_s}s"
+                msg = f"[{file_path.name}] Eccezione {type(e).__name__}: {e} — retry {retry}/{max_retries} tra {sleep_s}s"
                 logging.warning(msg)
-                syno_log_warn("RETRY", msg)
+                syno_log_warn("0x11100081", msg)
                 time.sleep(sleep_s)
                 continue
             raise
@@ -306,9 +288,15 @@ def resumable_upload(youtube, file_path: Path, title: str, description: str, pri
                 return response["id"]
             raise RuntimeError(f"Risposta inattesa API: {response}")
 
-# ========= Main =========
+# ======= Main =======
 def main():
     setup_logging()
+
+    # Pausa globale: se presente, esco subito (silenzioso)
+    if PAUSE_FLAG.exists():
+        print("Auth in pausa: .auth_paused presente. Esco.")
+        return
+
     cfg_path = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("/volume2/TubeSync/config.ini")
     cfg = load_config(cfg_path)
 
@@ -334,55 +322,56 @@ def main():
     to_email = cfg.get("email", "to_email", fallback=None)
 
     # Auth
-    syno_log_info("START", "Avvio autenticazione YouTube")
+    syno_log_info("0x11100070", "Avvio autenticazione YouTube")
     try:
         yt = get_authenticated_service(cfg)
-        syno_log_info("AUTH", "Autenticazione YouTube OK")
+        syno_log_info("0x11100071", "Autenticazione YouTube OK")
     except Exception as e:
         err = f"Autenticazione YouTube fallita: {e}"
         logging.error(err)
-        syno_log_err("AUTH_FAIL", err)
-        
-        # Invia email con istruzioni dettagliate
-        email_body = f"""ERRORE CRITICO: Autenticazione YouTube fallita
+        syno_log_err("0x11100073", err)
 
-Il TubeSync Watcher ha SOSPESO tutte le esecuzioni automatiche per evitare spam di email.
-
-Errore:
-{err}
-
-Dettagli tecnici:
-{traceback.format_exc()}
-
-AZIONI NECESSARIE:
-1. Verifica che il token YouTube sia valido
-2. Se il token è scaduto, rigeneralo seguendo la procedura di setup
-3. Dopo aver corretto il problema, riavvia il servizio con:
-   ./tubesync.sh restart
-
-Il watcher NON riproverà automaticamente fino al riavvio manuale del servizio.
-
-Timestamp: {time.strftime('%F %T')}
-"""
-        
+        # Metti in pausa globale per evitare spam: crea il flag
+        created_now = False
         try:
-            send_email(cfg, f"{subj_prefix} ERRORE CRITICO - Autenticazione fallita", email_body)
-        except Exception as email_err:
-            logging.error(f"Impossibile inviare email di notifica: {email_err}")
-        
+            if not PAUSE_FLAG.exists():
+                PAUSE_FLAG.touch()
+                created_now = True
+        except Exception:
+            pass
+
+        # Invia UNA SOLA email (solo quando creiamo ora il flag)
+        if created_now:
+            try:
+                body = (
+                    "ERRORE CRITICO: Autenticazione YouTube fallita\n\n"
+                    "Il TubeSync Watcher ha SOSPESO tutte le esecuzioni automatiche per evitare spam di email.\n\n"
+                    f"Errore:\n{err}\n\nDettagli tecnici:\n{traceback.format_exc()}\n\n"
+                    "AZIONI NECESSARIE:\n"
+                    "1. Verifica che il token YouTube sia valido\n"
+                    "2. Se il token è scaduto, rigeneralo seguendo la procedura di setup\n"
+                    "3. Dopo aver corretto il problema, riavvia il servizio con:\n"
+                    "   ./tubesync.sh restart\n\n"
+                    "Il watcher NON riproverà automaticamente fino al riavvio manuale del servizio.\n"
+                    f"Timestamp: {time.strftime('%F %T')}\n"
+                )
+                send_email(cfg, f"{subj_prefix} Auth error", body)
+            except Exception:
+                pass
+
         sys.exit(2)
 
     existing_title_map = {}
     if hydrate:
         logging.info("Idratazione: scarico elenco titoli dal canale (Uploads)...")
-        syno_log_info("HYDRATE", "Idratazione: scarico elenco titoli (Uploads)")
+        syno_log_info("0x11100072", "Idratazione: scarico elenco titoli (Uploads)")
         try:
             existing_title_map = fetch_existing_titles(yt)
             logging.info(f"Idratazione completata: {len(existing_title_map)} video trovati.")
-            syno_log_info("HYDRATE", f"Idratazione completata: {len(existing_title_map)} video trovati")
+            syno_log_info("0x11100073", f"Idratazione completata: {len(existing_title_map)} video trovati.")
         except Exception as e:
             logging.warning(f"Idratazione fallita (procedo): {e}")
-            syno_log_warn("HYDRATE", f"Idratazione fallita (procedo): {e}")
+            syno_log_warn("0x11100076", f"Idratazione fallita (procedo): {e}")
 
     count_total = count_done = count_skipped = count_errors = count_marked_done = 0
 
@@ -409,7 +398,7 @@ Timestamp: {time.strftime('%F %T')}
                     db_upsert(con, p, size, mtime, sha1, "done", found_vid, None)
                     count_marked_done += 1
                     logging.info(f"[{p.name}] Già presente su YouTube (ID: {found_vid}) → marcato done.")
-                    syno_log_info("SKIP", f"{p.name} già su YouTube (ID {found_vid})")
+                    syno_log_info("0x11100077", f"{p.name} già su YouTube (ID {found_vid}) → marcato done")
                     continue
 
             db_upsert(con, p, size, mtime, sha1, "pending", None, None)
@@ -419,14 +408,14 @@ Timestamp: {time.strftime('%F %T')}
 
             link = f"https://youtu.be/{video_id}"
             logging.info(f"[{p.name}] COMPLETATO: {link}")
-            syno_log_info("SUCCESS", f"{p.name} COMPLETATO: {link}")
-            send_email(cfg, f"{subj_prefix} OK - {p.name}",
+            syno_log_info("0x11100078", f"{p.name} COMPLETATO: {link}")
+            send_email(cfg, f"{subj_prefix} OK — {p.name}",
                        f"Caricamento completato.\n\nFile: {p}\nTitolo: {title}\nVideo ID: {video_id}\nLink: {link}\n")
 
         except Exception as e:
             count_errors += 1
             logging.error(f"[{p.name}] ERRORE: {e}")
-            syno_log_err("ERROR", f"{p.name} ERRORE: {e}")
+            syno_log_err("0x11100079", f"{p.name} ERRORE: {e}")
             logging.error(traceback.format_exc())
             try:
                 st = p.stat()
@@ -440,17 +429,18 @@ Timestamp: {time.strftime('%F %T')}
                 except Exception:
                     pass
             db_upsert(con, p, size, mtime, sha1, "error", None, str(e))
-            send_email(cfg, f"{subj_prefix} ERROR - {p.name}",
+            send_email(cfg, f"{subj_prefix} ERROR — {p.name}",
                        f"Caricamento FALLITO.\n\nFile: {p}\n\nErrore: {e}\n\nTraceback:\n{traceback.format_exc()}")
 
     summary = (f"Totale trovati: {count_total}, Caricati ora: {count_done}, "
                f"Segnati già presenti: {count_marked_done}, Skippati invariati: {count_skipped}, Errori: {count_errors}")
     logging.info(summary)
-    syno_log_info("SUMMARY", summary)
+    syno_log_info("0x1110007A", summary)
 
+    to_email = cfg.get("email", "to_email", fallback=None)
     if to_email and cfg.getboolean("email", "send_summary", fallback=True):
         if cfg.getboolean("email", "send_summary_when_noop", fallback=False) or any([count_done, count_marked_done, count_errors]):
-            send_email(cfg, f"{subj_prefix} Summary", summary)
+            send_email(cfg, f"{cfg.get('email','subject_prefix',fallback='[TubeSync] ')} Summary", summary)
 
 if __name__ == "__main__":
     main()
