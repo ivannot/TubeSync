@@ -10,18 +10,40 @@ from watchdog.events import PatternMatchingEventHandler
 # ======= PAUSA GLOBALE =========
 PAUSE_FLAG = Path("/volume2/TubeSync/.auth_paused")
 
-# ======= Log Center helper (forma testata) =======
-def syno_log_info(eid_hex: str, msg: str):
-    cmd = f'/usr/syno/bin/synologset1 sys info {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
-    subprocess.run(["/bin/sh", "-c", cmd], check=False)
+# ======= Log Center helper (FORZA eventID noto + fallback logger) =======
+FIXED_EID = "0x11100000"  # EventID noto che vedi in Log Center (System)
 
-def syno_log_warn(eid_hex: str, msg: str):
-    cmd = f'/usr/syno/bin/synologset1 sys warn {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
-    subprocess.run(["/bin/sh", "-c", cmd], check=False)
+def _syno_log(level: str, msg: str):
+    """
+    Prova a loggare in Log Center (System) usando synologset1 con un eventID noto e accettato.
+    In caso di errore, fa fallback su /usr/bin/logger -p user.INFO (così almeno qualcosa resta).
+    """
+    logger = logging.getLogger("TubeSyncWatcher")
 
-def syno_log_err(eid_hex: str, msg: str):
-    cmd = f'/usr/syno/bin/synologset1 sys err {eid_hex} "[TubeSync] {msg} - $(date \'+%F %T\')"'
-    subprocess.run(["/bin/sh", "-c", cmd], check=False)
+    # 1) synologset1 → System
+    cmd_sys = f'/usr/syno/bin/synologset1 sys {level} {FIXED_EID} "[TubeSync] {msg} - $(date \'+%F %T\')"'
+    cp = subprocess.run(["/bin/sh", "-c", cmd_sys], capture_output=True, text=True)
+
+    if cp.returncode == 0:
+        return  # ok, visibile in Log Center → System
+
+    # 2) fallback: /usr/bin/logger (user.info)
+    #   Nota: Log Center di default non sempre mostra user.*, ma almeno non perdiamo il messaggio
+    pri = "user.info" if level == "info" else ("user.warn" if level == "warn" else "user.err")
+    cmd_logger = f'/usr/bin/logger -t TubeSync -p {pri} "[TubeSync] {msg}"'
+    cp2 = subprocess.run(["/bin/sh", "-c", cmd_logger], capture_output=True, text=True)
+
+    # Traccia in console i fallimenti (così capiamo se e perché non si vede)
+    if cp.returncode != 0:
+        logger.warning(f"synologset1 FAILED rc={cp.returncode} level={level} eid={FIXED_EID} "
+                       f"stderr={cp.stderr.strip()} cmd={cmd_sys}")
+    if cp2.returncode != 0:
+        logger.warning(f"logger fallback FAILED rc={cp2.returncode} level={level} cmd={cmd_logger} "
+                       f"stderr={cp2.stderr.strip()}")
+
+def syno_log_info(msg: str): _syno_log("info", msg)
+def syno_log_warn(msg: str): _syno_log("warn", msg)
+def syno_log_err(msg: str):  _syno_log("err",  msg)
 
 # ======= Logging console (/dev/log se disponibile) =======
 def setup_logging():
@@ -60,7 +82,6 @@ class DebouncedRunner:
         threading.Thread(target=self._activity_loop, daemon=True).start()
 
     def trigger(self):
-        # Se in pausa, non schedulare nulla
         if PAUSE_FLAG.exists():
             self.log.info("Pausa attiva (.auth_paused): evento ignorato.")
             return
@@ -99,16 +120,16 @@ class DebouncedRunner:
             return
         msg = f"Esecuzione uploader: {' '.join(self.cmd)}"
         self.log.info(msg)
-        syno_log_info("0x11100043", msg)
+        syno_log_info(msg)
         try:
             proc = subprocess.Popen(self.cmd)
             code = proc.wait()
             msg2 = f"Uploader terminato con exit code {code}"
             self.log.info(msg2)
-            syno_log_info("0x11100044", msg2)
+            syno_log_info(msg2)
         except Exception as e:
             self.log.exception(f"Errore esecuzione uploader: {e}")
-            syno_log_err("0x11100044", f"Errore esecuzione uploader: {e}")
+            syno_log_err(f"Errore esecuzione uploader: {e}")
 
     def _rescan_loop(self):
         while True:
@@ -118,7 +139,7 @@ class DebouncedRunner:
                 self.log.info("Pausa attiva (.auth_paused): salto rescan periodico.")
                 continue
             self.log.info("Rescan periodico: trigger massivo.")
-            syno_log_info("0x11100045", "Rescan periodico: trigger massivo.")
+            syno_log_info("Rescan periodico: trigger massivo.")
             self._run()
 
     def _activity_loop(self):
@@ -128,7 +149,7 @@ class DebouncedRunner:
                 ago = int(time.time() - self._last_event_ts)
                 msg = f"Eventi recenti: ultimo {ago}s fa; debounce={self.debounce}s, settle={self.settle}s."
                 self.log.info(msg)
-                syno_log_info("0x11100046", msg)
+                syno_log_info(msg)
 
 # ======= Watchdog handler =======
 class Handler(PatternMatchingEventHandler):
@@ -142,7 +163,7 @@ class Handler(PatternMatchingEventHandler):
     def _log(self, typ, path):
         msg = f"{typ}: {path}"
         self.log.info(msg)
-        syno_log_info("0x11100047", msg)
+        syno_log_info(msg)
 
 # ======= Config & patterns =======
 def read_config(cfg_path: Path) -> ConfigParser:
@@ -185,7 +206,7 @@ def main():
     exts = [e.strip() for e in cfg.get("general", "allowed_extensions").split(",") if e.strip()]
     patterns = build_patterns_from_extensions(exts)
     logger.info(f"Estensioni monitorate: {patterns}")
-    syno_log_info("0x11100041", f"Watcher avviato. Estensioni: {patterns}")
+    syno_log_info(f"Watcher avviato. Estensioni: {patterns}")
 
     debounce_seconds = cfg.getint("watcher", "debounce_seconds", fallback=90)
     settle_seconds = cfg.getint("watcher", "settle_seconds", fallback=60)
@@ -195,17 +216,27 @@ def main():
 
     cmd = ["/volume2/TubeSync/.venv/bin/python3", "/volume2/TubeSync/tubesync_synology.py", str(cfg_path)]
 
-    logger.info("Avvio watcher: scansione iniziale.")
-    syno_log_info("0x11100042", "Scansione iniziale: lancio uploader")
-
     runner = DebouncedRunner(logger, cmd, debounce_seconds, settle_seconds, max_debounce_seconds,
                              rescan_minutes, event_log_interval_seconds)
 
-    # Scansione iniziale: rispettare la PAUSA
+    # Scansione iniziale
+    logger.info("Avvio watcher: scansione iniziale.")
+    syno_log_info("Scansione iniziale: lancio uploader")
+
     if PAUSE_FLAG.exists():
         logger.info("Pausa attiva (.auth_paused): salto scansione iniziale.")
+        syno_log_warn("Scansione iniziale SKIPPED per pausa auth")
     else:
-        runner._run()
+        try:
+            logger.info(f"Esecuzione uploader: {' '.join(cmd)}")
+            syno_log_info(f"Esecuzione uploader: {' '.join(cmd)}")
+            proc = subprocess.Popen(cmd)
+            code = proc.wait()
+            logger.info(f"Uploader terminato con exit code {code}")
+            syno_log_info(f"Uploader terminato con exit code {code}")
+        except Exception as e:
+            logger.exception(f"Errore esecuzione uploader: {e}")
+            syno_log_err(f"Errore esecuzione uploader: {e}")
 
     observer = Observer()
     any_root = False
@@ -214,28 +245,28 @@ def main():
         if not p.exists():
             w = f"Cartella NON trovata: {p}"
             logger.warning(w)
-            syno_log_warn("0x11100048", w)
+            syno_log_warn(w)
             continue
         any_root = True
         logger.info(f"Osservo: {p}")
-        syno_log_info("0x11100045", f"Osservo: {p}")
+        syno_log_info(f"Osservo: {p}")
         observer.schedule(Handler(logger, runner, patterns), str(p), recursive=True)
 
     if not any_root:
         e = "Nessuna root valida da osservare. Esco."
         logger.error(e)
-        syno_log_err("0x1110004A", e)
+        syno_log_err(e)
         sys.exit(3)
 
     observer.start()
     logger.info("TubeSync Watcher attivo. In attesa di eventi...")
-    syno_log_info("0x1110004B", "TubeSync Watcher attivo. In attesa di eventi...")
+    syno_log_info("TubeSync Watcher attivo. In attesa di eventi...")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Stop watcher (KeyboardInterrupt)")
-        syno_log_info("0x1110004C", "Stop watcher (KeyboardInterrupt)")
+        syno_log_info("Stop watcher (KeyboardInterrupt)")
         observer.stop()
     observer.join()
 
